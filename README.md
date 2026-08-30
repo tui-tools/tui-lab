@@ -68,6 +68,9 @@ A first `lab.sh all up` on a cold cache takes a few minutes, most of it download
 ./lab.sh test tui-firewall       # build, ship and test on all three
 ./lab.sh test tui-systemd fedora # one VM
 ./lab.sh test tui-snapper --bin /path/to/binary   # skip the build
+./lab.sh report tui-firewall     # check the --report block on all three
+./lab.sh report tui-secure fedora # one VM
+./lab.sh report all              # every sibling tool checkout
 ./lab.sh snapshot ubuntu clean   # qcow2 snapshot (VM must be stopped)
 ./lab.sh restore ubuntu clean
 ./lab.sh all down
@@ -135,6 +138,39 @@ $ tui-systemd --check | head -8
 ```
 
 That is what makes assertions like "the tool's active-unit count equals `systemctl`'s" possible — which is the assertion that actually catches a parser regression, because a tool that fetched the output but failed to parse it reports zero.
+
+### `lab.sh report`, the block checked where it has something to leak
+
+Every tool answers `--report` with the plain `key: value` block a bug report is pasted from. That makes it two things at once: the first thing a maintainer reads, and a privacy promise — the block goes into a public issue, so a home path, a user name or the machine's own host name appearing in it is a bug rather than a cosmetic detail.
+
+The promise is the half a unit test cannot check. A fixture has no host name to leak. A guest does, and it is a guest, so `report` runs the real block on each of the three:
+
+```console
+$ ./lab.sh report tui-firewall omarchy
+
+==> === tui-firewall --report on omarchy ===
+--- tui-firewall --report (live) on omarchy
+    tui-firewall dev (kit v0.2.9)
+    backend: ufw 0.36.2
+    mode: live
+    distro: omarchy-server 4.0.1 (Omarchy Server 4.0.1)
+    kernel: 7.1.11-arch1-1
+    ...
+PASS  live exits 0
+PASS  live headline names tui-firewall
+PASS  live names neither this machine, its user nor a home path
+...
+VERDICT  tui-firewall --report on omarchy: PASS
+```
+
+It builds and ships the binary exactly the way `test` does, prints both blocks the tool can produce — live and under `--demo` — and asserts four things about each:
+
+1. It **exits 0**.
+2. Its **first line names the tool**. A block pasted into the wrong repository should say so in the line the maintainer reads first.
+3. It **names nothing about this machine**: not the guest's host name, not a path under `/home` or `/root`, not the lab user's name. The `distro` and `kernel` lines are excluded from the host-name search rather than from the promise — they are built from `/etc/os-release` and from `uname`'s release and machine fields, never from its nodename, and every guest here is named after its distribution, so `fedora` belongs in both of them.
+4. The `--demo` block says **`backend: demo`**. A demo block that does not announce itself is the worst kind of bug report: every number in it is sample data and nothing says so.
+
+A failed assertion shows the offending line and fails the command, so it fits a pre-release check. `report all` does the same for every sibling checkout that has a `cmd/<name>` package.
 
 ## Results from a real run
 
