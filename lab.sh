@@ -12,7 +12,7 @@
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
-#   lab.sh router up|down|status|test [--via-tool [PATH]]
+#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -35,6 +35,56 @@ ovmf_dir="${OVMF_DIR:-/usr/share/edk2/ovmf}"
 # The lab user is the same everywhere: the smoke tests are written against one
 # name and escalate with `sudo -n`.
 lab_user=lab
+
+# ---------------------------------------------------------------------------
+# Backend selection
+# ---------------------------------------------------------------------------
+# The lab has two ways to run a guest. `qemu` (the default) boots it locally
+# with QEMU/KVM and reaches it over a user-mode ssh hostfwd on the loopback —
+# no root, no bridges, portable, and capped at two endpoints per socket
+# segment. `libvirt` hands the whole thing to a real hypervisor over
+# qemu+ssh: KVM domains on the avell notebook, on real virtual networks with
+# multiple NICs per guest. The default stays local so day-to-day iteration
+# needs nothing but this host.
+#
+# Selected by `LAB_BACKEND=libvirt` or `--backend libvirt` on the router
+# command. Everything below keyed on it lives behind these names so the
+# router flow reads the same on either backend.
+lab_backend="${LAB_BACKEND:-qemu}"
+
+# The libvirt connection and the ssh jump host that reaches the guests. The
+# guests sit on a NAT management network on the hypervisor, unreachable from
+# here directly, so every ssh to one is proxied through the hypervisor.
+libvirt_uri="${LAB_LIBVIRT_URI:-qemu:///system}"
+libvirt_jump="${LAB_LIBVIRT_JUMP:-}"
+
+# The image pool. It MUST live under /home on the avell: / there has ~31G,
+# /home has ~125G, and a base image plus overlays does not fit in the former.
+libvirt_pool="${LAB_LIBVIRT_POOL:-tuilab}"
+libvirt_pool_path="${LAB_LIBVIRT_POOL_PATH:-$HOME/tuilab/images}"
+
+# Every libvirt object this backend creates is namespaced `tuilab-` so it can
+# never be confused with the operator's own `zc-lab-*` domains on the same
+# hypervisor. The management subnet is picked clear of the host's existing
+# `default` (192.168.122.0/24) and `zc-lab` (10.190.0.0/24) networks.
+libvirt_mgmt_net="tuilab-mgmt"
+libvirt_wan_net="tuilab-wan"
+libvirt_lan_net="tuilab-lan"
+libvirt_mgmt_subnet="192.168.199"
+libvirt_base_vol="tuilab-base-noble.qcow2"
+
+# lv runs one virsh command against the hypervisor. `define`, `net-define`
+# and `pool-define` read their XML from a path on THIS host and transmit it,
+# so the callers hand it a local temp file.
+lv() { virsh -c "$libvirt_uri" "$@"; }
+
+# avell_ssh / avell_scp stage files in the pool on the hypervisor: the base
+# image, the per-guest overlays and the cloud-init seed ISOs. The pool
+# directory is owned by the login user; libvirt (root) re-owns a disk image
+# to the qemu user at domain start and restores it after, so the files can be
+# created here without privilege. Never wrapped in `timeout` — the lab rule.
+avell_ssh() { ssh "$libvirt_jump" "$@"; }
+avell_scp() { scp -q "$1" "$libvirt_jump:$2"; }
 
 # ---------------------------------------------------------------------------
 # Image catalogue
@@ -83,6 +133,10 @@ vm_port() { echo $(( 2300 + ( $(printf '%s' "$1" | cksum | cut -d' ' -f1) % 60 )
 vm_dir() { echo "$out/vm/$1"; }
 
 vm_running() {
+  if [[ $lab_backend == libvirt ]]; then
+    [[ "$(lv domstate "tuilab-$1" 2>/dev/null)" == running ]]
+    return
+  fi
   local pidfile; pidfile="$(vm_dir "$1")/pid"
   [[ -f $pidfile ]] && kill -0 "$(<"$pidfile")" 2>/dev/null
 }
@@ -116,9 +170,34 @@ lab_key() {
 # the seventh connection from one source inside thirty seconds, so a test that
 # opens a connection per command rate-limits itself out. Multiplexing turns the
 # burst into sessions over a single TCP connection.
+# vm_host is where ssh connects for a guest: the loopback with a per-VM
+# hostfwd port on the qemu backend, or the guest's fixed management address on
+# the libvirt backend, reached through the hypervisor by ProxyJump.
+vm_host() {
+  if [[ $lab_backend == libvirt ]]; then libvirt_mgmt_ip "$1"; else echo localhost; fi
+}
+
 ssh_opts() {
-  local name="$1" port; port="$(vm_port "$name")"
+  local name="$1"
   mkdir -p "$control_dir"
+  if [[ $lab_backend == libvirt ]]; then
+    # Port 22 on the guest's own address, reached through the hypervisor. The
+    # guest is on a NAT network this host cannot route to, so every session is
+    # proxied through the avell, which this host can already ssh to.
+    printf '%s\n' \
+      -p 22 \
+      -o ProxyJump="$libvirt_jump" \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      -o ControlMaster=auto \
+      -o ControlPath="$control_dir/%C" \
+      -o ControlPersist=120 \
+      -i "$(lab_key)" \
+      -o IdentitiesOnly=yes
+    return
+  fi
+  local port; port="$(vm_port "$name")"
   printf '%s\n' \
     -p "$port" \
     -o StrictHostKeyChecking=no \
@@ -134,7 +213,7 @@ ssh_opts() {
 vm_ssh() {
   local name="$1"; shift
   local opts; mapfile -t opts < <(ssh_opts "$name")
-  ssh "${opts[@]}" "$lab_user@localhost" "$@"
+  ssh "${opts[@]}" "$lab_user@$(vm_host "$name")" "$@"
 }
 
 vm_scp() {
@@ -143,7 +222,7 @@ vm_scp() {
   # scp takes -P for the port where ssh takes -p, so the shared list is
   # rewritten rather than reused verbatim.
   opts[0]=-P
-  scp "${opts[@]}" "$src" "$lab_user@localhost:$dst"
+  scp "${opts[@]}" "$src" "$lab_user@$(vm_host "$name"):$dst"
 }
 
 # vm_wait_ssh polls until the guest answers. It never wraps ssh in `timeout`:
@@ -158,7 +237,7 @@ vm_wait_ssh() {
   local opts; mapfile -t opts < <(ssh_opts "$name")
   for ((i = 0; i < limit; i += 10)); do
     if ssh "${opts[@]}" -o ConnectTimeout=5 -o BatchMode=yes \
-      "$lab_user@localhost" true 2>/dev/null; then
+      "$lab_user@$(vm_host "$name")" true 2>/dev/null; then
       echo "ssh up after ${i}s"
       return 0
     fi
@@ -508,6 +587,16 @@ vm_mac() {
 
 cmd_down() {
   local name="$1"
+  if [[ $lab_backend == libvirt ]]; then
+    local dom="tuilab-$name" i
+    lv domstate "$dom" >/dev/null 2>&1 || { log "$name not defined"; return 0; }
+    vm_running "$name" || { log "$name not running"; return 0; }
+    lv shutdown "$dom" >/dev/null 2>&1 || true
+    for ((i = 0; i < 40; i++)); do vm_running "$name" || break; sleep 1; done
+    vm_running "$name" && lv destroy "$dom" >/dev/null 2>&1 || true
+    log "stopped $name"
+    return 0
+  fi
   vm_running "$name" || { log "$name not running"; return 0; }
   monitor "$name" 'system_powerdown' >/dev/null || true
   local i
@@ -1071,6 +1160,250 @@ router_nics() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# The libvirt backend for the router topology
+# ---------------------------------------------------------------------------
+# The same three guests as the qemu backend, but as KVM domains on the avell
+# hypervisor over real virtual networks. mgmt is a NAT network with a fixed
+# lease per guest, so the lab knows each address before the guest boots and
+# reaches it by ssh through the hypervisor. wan and lan are pure isolated
+# switches: no host IP, no DHCP, the router owns every address on them. The
+# guest cloud-init network-config is the same one the qemu backend renders —
+# it matches interfaces by the MAC this script assigns, and those MACs are put
+# on the domain's NICs here, so `wan0`/`lan0` name the same links on both.
+
+# libvirt_mgmt_ip is the fixed management address a guest gets from the mgmt
+# network's static DHCP lease. It is what ssh connects to (through the jump).
+libvirt_mgmt_ip() {
+  case "$1" in
+    router) echo "$libvirt_mgmt_subnet.2" ;;
+    wan-host) echo "$libvirt_mgmt_subnet.20" ;;
+    lan-client) echo "$libvirt_mgmt_subnet.30" ;;
+    *) die "libvirt backend has no management address for guest: $1" ;;
+  esac
+}
+
+# libvirt_ensure_networks defines mgmt (NAT, with the three fixed leases) and
+# wan/lan (isolated) if they are absent. Every name is `tuilab-*`, and the
+# mgmt subnet is clear of the host's own networks.
+libvirt_ensure_networks() {
+  if ! lv net-info "$libvirt_mgmt_net" >/dev/null 2>&1; then
+    log "defining network $libvirt_mgmt_net (NAT $libvirt_mgmt_subnet.0/24)"
+    local nx; nx="$(mktemp)"
+    cat >"$nx" <<EOF
+<network>
+  <name>$libvirt_mgmt_net</name>
+  <bridge name='tuilabmgmt0'/>
+  <forward mode='nat'/>
+  <ip address='$libvirt_mgmt_subnet.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='$libvirt_mgmt_subnet.100' end='$libvirt_mgmt_subnet.200'/>
+      <host mac='$(vm_mac router 0)' name='tuilab-router' ip='$libvirt_mgmt_subnet.2'/>
+      <host mac='$(vm_mac wan-host 0)' name='tuilab-wan-host' ip='$libvirt_mgmt_subnet.20'/>
+      <host mac='$(vm_mac lan-client 0)' name='tuilab-lan-client' ip='$libvirt_mgmt_subnet.30'/>
+    </dhcp>
+  </ip>
+</network>
+EOF
+    lv net-define "$nx" >/dev/null
+    lv net-start "$libvirt_mgmt_net" >/dev/null
+    lv net-autostart "$libvirt_mgmt_net" >/dev/null || true
+    rm -f "$nx"
+  fi
+  # wan and lan carry the topology and nothing else: no forward, no host IP,
+  # no DHCP. That is what makes the NAT and forwarding checks mean something —
+  # the only way between the segments is through the router.
+  local seg name br sx
+  for seg in wan lan; do
+    name="tuilab-$seg"; br="tuilab${seg}0"
+    if ! lv net-info "$name" >/dev/null 2>&1; then
+      log "defining isolated network $name"
+      sx="$(mktemp)"
+      cat >"$sx" <<EOF
+<network>
+  <name>$name</name>
+  <bridge name='$br'/>
+</network>
+EOF
+      lv net-define "$sx" >/dev/null
+      lv net-start "$name" >/dev/null
+      lv net-autostart "$name" >/dev/null || true
+      rm -f "$sx"
+    fi
+  done
+}
+
+# libvirt_ensure_infra makes the pool, the networks and the base image exist.
+# The pool directory is owned by the login user so overlays and seeds stage
+# without privilege; libvirt re-owns a disk to qemu at start and restores it
+# after. The base image is uploaded once and every guest is a thin overlay.
+libvirt_ensure_infra() {
+  need virsh qemu-img ssh scp
+  avell_ssh "mkdir -p '$libvirt_pool_path'"
+
+  if ! lv pool-info "$libvirt_pool" >/dev/null 2>&1; then
+    log "defining libvirt pool $libvirt_pool at $libvirt_pool_path"
+    local px; px="$(mktemp)"
+    cat >"$px" <<EOF
+<pool type='dir'>
+  <name>$libvirt_pool</name>
+  <target><path>$libvirt_pool_path</path></target>
+</pool>
+EOF
+    lv pool-define "$px" >/dev/null
+    lv pool-start "$libvirt_pool" >/dev/null || true
+    lv pool-autostart "$libvirt_pool" >/dev/null || true
+    rm -f "$px"
+  fi
+
+  libvirt_ensure_networks
+
+  if ! avell_ssh "test -f '$libvirt_pool_path/$libvirt_base_vol'"; then
+    local img; img="$(cmd_fetch "$router_distro" | tail -1)"
+    log "uploading base image to the pool, once: $(basename "$img")"
+    avell_scp "$img" "$libvirt_pool_path/$libvirt_base_vol"
+  fi
+}
+
+# libvirt_iface is one <interface> on a network with a fixed MAC.
+libvirt_iface() {
+  cat <<EOF
+    <interface type='network'>
+      <source network='$1'/>
+      <mac address='$2'/>
+      <model type='virtio'/>
+    </interface>
+EOF
+}
+
+# libvirt_domain_xml renders one guest. BIOS boot (no OVMF) keeps the avell
+# side simple: the Ubuntu cloud image boots either way. Every guest gets the
+# mgmt NIC; the topology NICs are per role, on the isolated segments, with the
+# same MACs the cloud-init network-config matches by.
+libvirt_domain_xml() {
+  local role="$1" mem="$2" cpus="$3" pool="$libvirt_pool_path" topo=""
+  case "$role" in
+    router)
+      topo="$(libvirt_iface "$libvirt_wan_net" "$(vm_mac router 1)")$(libvirt_iface "$libvirt_lan_net" "$(vm_mac router 2)")" ;;
+    wan-host)
+      topo="$(libvirt_iface "$libvirt_wan_net" "$(vm_mac wan-host 1)")" ;;
+    lan-client)
+      topo="$(libvirt_iface "$libvirt_lan_net" "$(vm_mac lan-client 1)")" ;;
+  esac
+  cat <<EOF
+<domain type='kvm'>
+  <name>tuilab-$role</name>
+  <memory unit='MiB'>$mem</memory>
+  <vcpu>$cpus</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features><acpi/><apic/></features>
+  <cpu mode='host-passthrough'/>
+  <clock offset='utc'/>
+  <on_reboot>restart</on_reboot>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='$pool/tuilab-$role.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='$pool/tuilab-$role-seed.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <interface type='network'>
+      <source network='$libvirt_mgmt_net'/>
+      <mac address='$(vm_mac "$role" 0)'/>
+      <model type='virtio'/>
+    </interface>
+$topo
+    <serial type='pty'><target port='0'/></serial>
+    <console type='pty'><target type='serial' port='0'/></console>
+    <graphics type='vnc' autoport='yes' listen='127.0.0.1'/>
+    <video><model type='virtio'/></video>
+    <memballoon model='virtio'/>
+    <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>
+  </devices>
+</domain>
+EOF
+}
+
+# libvirt_boot_guest stages the overlay and seed in the pool and defines and
+# starts the domain. A stale domain of the same name is undefined first so its
+# XML is always this run's.
+libvirt_boot_guest() {
+  local role="$1" mem="$2" cpus="$3" disk="$4" pool="$libvirt_pool_path"
+  libvirt_ensure_infra
+  local dir; dir="$(vm_dir "$role")"
+  mkdir -p "$dir"
+  [[ -f $dir/seed.iso ]] || write_seed "$router_distro" "$role" "$dir" "$role"
+
+  if lv domstate "tuilab-$role" >/dev/null 2>&1; then
+    lv undefine "tuilab-$role" >/dev/null 2>&1 || true
+  fi
+  avell_ssh "rm -f '$pool/tuilab-$role.qcow2' '$pool/tuilab-$role-seed.iso'"
+  log "creating overlay and seed for $role in the pool"
+  avell_ssh "qemu-img create -q -f qcow2 -F qcow2 -b '$pool/$libvirt_base_vol' '$pool/tuilab-$role.qcow2' ${disk}G >/dev/null"
+  avell_scp "$dir/seed.iso" "$pool/tuilab-$role-seed.iso"
+
+  local dx; dx="$(mktemp)"
+  libvirt_domain_xml "$role" "$mem" "$cpus" >"$dx"
+  lv define "$dx" >/dev/null
+  lv start "tuilab-$role" >/dev/null
+  rm -f "$dx"
+  log "started tuilab-$role (mgmt $(libvirt_mgmt_ip "$role"), ${mem}M, ${cpus} cpu)"
+}
+
+# libvirt_router_teardown removes every tuilab-* domain, its overlay and seed,
+# and the three networks. It leaves the pool and the base image in place, so
+# the next `router up` is a few seconds of overlay creation, not a re-upload.
+# Every object it names is `tuilab-*`; it never touches anything else.
+libvirt_router_teardown() {
+  local role dom pool="$libvirt_pool_path"
+  for role in lan-client wan-host router; do
+    dom="tuilab-$role"
+    if lv domstate "$dom" >/dev/null 2>&1; then
+      [[ "$(lv domstate "$dom")" == running ]] && lv destroy "$dom" >/dev/null 2>&1 || true
+      lv undefine "$dom" >/dev/null 2>&1 || true
+      log "removed domain $dom"
+    fi
+    avell_ssh "rm -f '$pool/tuilab-$role.qcow2' '$pool/tuilab-$role-seed.iso' '$pool/tuilab-$role-serial.log'"
+  done
+  local net
+  for net in "$libvirt_wan_net" "$libvirt_lan_net" "$libvirt_mgmt_net"; do
+    if lv net-info "$net" >/dev/null 2>&1; then
+      lv net-destroy "$net" >/dev/null 2>&1 || true
+      lv net-undefine "$net" >/dev/null 2>&1 || true
+      log "removed network $net"
+    fi
+  done
+  log "left pool $libvirt_pool and base image $libvirt_base_vol in place for next time"
+}
+
+# router_boot_one boots one topology guest on whichever backend is selected,
+# then waits for ssh and for cloud-init to finish — the same "ready to test"
+# bar `up` means for any other lab VM.
+router_boot_one() {
+  local role="$1" mem="$2" cpus="$3" disk="$4"
+  if [[ $lab_backend == libvirt ]]; then
+    libvirt_boot_guest "$role" "$mem" "$cpus" "$disk"
+  else
+    local dir; dir="$(vm_dir "$role")"
+    vm_prepare_disks "$role" "$router_distro" "$dir" "$disk" 1
+    [[ -f $dir/seed.iso ]] || write_seed "$router_distro" "$role" "$dir" "$role"
+    router_nics "$role"
+    mgmt_mac="$(vm_mac "$role" 0)"
+    vm_launch "$role" "$dir" "$mem" "$cpus"
+  fi
+  vm_wait_ssh "$role" "${WAIT:-900}"
+  log "waiting for cloud-init to finish on $role"
+  vm_ssh "$role" "sudo -n cloud-init status --wait >/dev/null 2>&1 || true; sudo -n cloud-init status --long 2>&1 | head -3" || true
+}
+
 cmd_router_up() {
   local mem=1536 cpus=2 disk=12
   while (($#)); do
@@ -1081,45 +1414,59 @@ cmd_router_up() {
       *) die "unknown option: $1" ;;
     esac
   done
-  need qemu-system-x86_64 qemu-img ssh socat
+  if [[ $lab_backend == libvirt ]]; then
+    need virsh qemu-img ssh scp
+  else
+    need qemu-system-x86_64 qemu-img ssh socat
+  fi
 
-  local role dir
+  local role
   for role in router wan-host lan-client; do
-    dir="$(vm_dir "$role")"
     if vm_running "$role"; then
-      log "$role already running (pid $(<"$dir/pid"))"
+      log "$role already running"
       continue
     fi
-    vm_prepare_disks "$role" "$router_distro" "$dir" "$disk" 1
-    [[ -f $dir/seed.iso ]] || write_seed "$router_distro" "$role" "$dir" "$role"
-    router_nics "$role"
-    mgmt_mac="$(vm_mac "$role" 0)"
-    vm_launch "$role" "$dir" "$mem" "$cpus"
-    vm_wait_ssh "$role" "${WAIT:-900}"
-    log "waiting for cloud-init to finish on $role"
-    vm_ssh "$role" "sudo -n cloud-init status --wait >/dev/null 2>&1 || true; sudo -n cloud-init status --long 2>&1 | head -3" || true
+    router_boot_one "$role" "$mem" "$cpus" "$disk"
   done
 
   # The management NIC's own default route exists so cloud-init could reach the
   # archive. Now that the guest is provisioned it would be a second way out of
   # the LAN, and the point of the client is that its only way out is the router.
-  # 10.0.2.2 is QEMU's user-mode gateway, the same on every guest.
+  # The mgmt gateway is QEMU's 10.0.2.2 on the qemu backend and the mgmt
+  # network's own address on libvirt.
+  local mgmt_gw="10.0.2.2"
+  [[ $lab_backend == libvirt ]] && mgmt_gw="$libvirt_mgmt_subnet.1"
   log "pointing lan-client's default route at the router"
-  vm_ssh lan-client "sudo -n ip -4 route del default via 10.0.2.2 2>/dev/null || true; ip -4 route show default" || true
+  vm_ssh lan-client "sudo -n ip -4 route del default via $mgmt_gw 2>/dev/null || true; ip -4 route show default" || true
 
   cmd_router_status
 }
 
 cmd_router_down() {
+  if [[ $lab_backend == libvirt ]]; then libvirt_router_teardown; return; fi
   local role
   for role in lan-client wan-host router; do cmd_down "$role"; done
 }
 
 cmd_router_status() {
-  cmd_status router lan-client wan-host
-  printf 'links    wan %s (%s)   lan %s (%s)\n' \
-    "$router_wan_link" "$router_wan_net" "$router_lan_link" "$router_lan_net"
   local role
+  if [[ $lab_backend == libvirt ]]; then
+    printf 'backend  libvirt (%s)\n' "$libvirt_uri"
+    printf 'nets     %s (%s.0/24 nat)   %s (%s, isolated)   %s (%s, isolated)\n' \
+      "$libvirt_mgmt_net" "$libvirt_mgmt_subnet" \
+      "$libvirt_wan_net" "$router_wan_net" "$libvirt_lan_net" "$router_lan_net"
+    for role in router lan-client wan-host; do
+      if vm_running "$role"; then
+        printf '%-11s running  mgmt %s\n' "$role" "$(libvirt_mgmt_ip "$role")"
+      else
+        printf '%-11s stopped\n' "$role"
+      fi
+    done
+  else
+    cmd_status router lan-client wan-host
+    printf 'links    wan %s (%s)   lan %s (%s)\n' \
+      "$router_wan_link" "$router_wan_net" "$router_lan_link" "$router_lan_net"
+  fi
   for role in router lan-client wan-host; do
     vm_running "$role" || continue
     printf '%s:\n' "$role"
@@ -1808,12 +2155,22 @@ cmd_router_test_via_tool() {
 }
 
 cmd_router() {
-  local sub="${1:?up|down|status|test}"; shift || true
+  # --backend selects qemu (default) or libvirt for the whole router command,
+  # wherever it appears; the rest is the subcommand and its own options.
+  local sub="" rest=()
+  while (($#)); do
+    case "$1" in
+      --backend) lab_backend="${2:?--backend needs qemu or libvirt}"; shift 2 ;;
+      *) if [[ -z $sub ]]; then sub="$1"; else rest+=("$1"); fi; shift ;;
+    esac
+  done
+  [[ $lab_backend == qemu || $lab_backend == libvirt ]] || die "unknown backend: $lab_backend"
+  [[ -n $sub ]] || die "router: expected up, down, status or test"
   case "$sub" in
-    up) cmd_router_up "$@" ;;
+    up) cmd_router_up "${rest[@]}" ;;
     down) cmd_router_down ;;
     status) cmd_router_status ;;
-    test) cmd_router_test "$@" ;;
+    test) cmd_router_test "${rest[@]}" ;;
     *) die "router: expected up, down, status or test" ;;
   esac
 }

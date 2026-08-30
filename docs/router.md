@@ -229,6 +229,77 @@ Everything else the acceptance needs is there: rules in the input, forward and
 output views, chain policies, masquerade, port forwards, aliases and their
 members, and delete for each of them.
 
+## The libvirt backend
+
+The QEMU socket backend above is portable and needs no root, but a socket
+segment carries exactly two endpoints and the whole thing runs on one laptop.
+The libvirt backend trades that portability for a real hypervisor: the same
+three guests as KVM domains on a second machine, over real virtual networks
+with a NIC per segment, so a heavy run does not compete with the machine the
+work is being done on. The socket backend stays the default; libvirt is opt-in.
+
+Select it with `--backend libvirt` on the router command, or `LAB_BACKEND=libvirt`
+in the environment:
+
+```bash
+./lab.sh router --backend libvirt up
+./lab.sh router --backend libvirt test
+./lab.sh router --backend libvirt test --via-tool /path/to/tui-firewall
+./lab.sh router --backend libvirt down
+```
+
+Everything the flow does above is the same on this backend — the checks, the
+TUI driver, the evidence under `out/`. What changes is underneath: where a
+guest runs and how the lab reaches it.
+
+### What it builds on the hypervisor
+
+Every object is namespaced `tuilab-` so it can never be confused with anything
+already on the host.
+
+| Object | Name | What it is |
+|--------|------|------------|
+| Storage pool | `tuilab` | A `dir` pool at `$HOME/tuilab/images` (set `LAB_LIBVIRT_POOL_PATH` to move it). It **must** live under `/home`: `/` on the avell has ~31G, `/home` has ~125G, and a base image plus overlays does not fit in the former. |
+| Base volume | `tuilab-base-noble.qcow2` | The Ubuntu cloud image, uploaded into the pool once. Every guest is a thin qcow2 overlay on it, so three guests cost a few gigabytes, not three full images. |
+| Management network | `tuilab-mgmt` | A NAT network, `192.168.199.0/24`, with a fixed DHCP lease per guest (router `.2`, wan-host `.20`, lan-client `.30`). It carries ssh and the archive, nothing topological — the same role the user-mode NIC plays on the socket backend. Its subnet is chosen clear of the host's own `default` and any existing lab network. |
+| WAN segment | `tuilab-wan` | An **isolated** network: a bridge with no forward, no host address and no DHCP. The router owns the only addresses on it. |
+| LAN segment | `tuilab-lan` | The same, for the LAN. |
+| Domains | `tuilab-router`, `tuilab-wan-host`, `tuilab-lan-client` | One per role, BIOS boot, an overlay disk, the cloud-init seed as a CD-ROM, the mgmt NIC and this role's topology NICs. |
+
+The guest cloud-init `network-config` is the very same one the socket backend
+renders: it matches interfaces by the MAC this script assigns and renames them,
+and those MACs are put on the domains' NICs here, so `wan0` and `lan0` name the
+same links on both backends.
+
+The lab runs on the coordinating machine and the guests run on the avell, on a
+NAT network this machine cannot route to directly. So every ssh to a guest is
+proxied through the hypervisor — the lab's own ssh access to the avell is the
+jump — and lands on the guest's fixed management address. `router up` then
+deletes the client's management default route exactly as it does on the socket
+backend, so the machine the tests see still has one way out and it is the router.
+
+`router down` on this backend is a full teardown: it destroys and undefines the
+three domains, removes their overlays and seeds, and removes the three networks.
+It **leaves the pool and the base image in place**, so the next `up` is a few
+seconds of overlay creation rather than another upload. Nothing outside the
+`tuilab-` namespace is ever touched.
+
+### Prerequisites on the avell
+
+- libvirt with a running `libvirtd`, reachable at
+  `qemu+ssh://<user>@<hypervisor>/system` (set `LAB_LIBVIRT_URI`; a jump host via `LAB_LIBVIRT_JUMP`) from the coordinating machine (this
+  host needs a local `virsh` and ssh access to the avell; `virsh define` and
+  friends read their XML here and transmit it).
+- `/dev/kvm`, and the login user in the `libvirt` group.
+- `qemu-img` on the avell (the overlays are created there) and enough room under
+  `/home` for the pool.
+- ssh from the coordinating machine to the avell, since the guests are reached
+  through it. Guest ssh uses the same throwaway lab key as every other lab VM.
+
+The connection URI, jump host, pool name and path are overridable with
+`LAB_LIBVIRT_URI`, `LAB_LIBVIRT_JUMP`, `LAB_LIBVIRT_POOL` and
+`LAB_LIBVIRT_POOL_PATH`.
+
 ## Usage
 
 ```bash
@@ -238,6 +309,10 @@ members, and delete for each of them.
 ./lab.sh router test --via-tool ../tui-firewall/tui-firewall
                             # the same proofs, typed into the real TUI
 ./lab.sh router down
+
+./lab.sh router --backend libvirt up     # the same, as KVM domains on the avell
+./lab.sh router --backend libvirt test
+./lab.sh router --backend libvirt down   # full teardown, base image kept
 ```
 
 `lab.sh ssh router …`, `lab.sh ssh lan-client …` and `lab.sh ssh wan-host …`
