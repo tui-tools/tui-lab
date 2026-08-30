@@ -137,7 +137,7 @@ That is what makes assertions like "the tool's active-unit count equals `systemc
 
 ## Results from a real run
 
-Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
+Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row was re-run on `2026-08-30`.
 
 ```bash
 ./lab.sh all up
@@ -163,7 +163,7 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
 | **tui-users** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** |
 | **tui-ssh** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
 | **tui-disk** | version, demo frame, smoke **13/13** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
-| **tui-update** | version, demo frame, smoke **11/11** | version, demo frame, smoke **10/10** | version, demo frame, smoke **2/12** — see below |
+| **tui-update** | version, demo frame, smoke **12/12** | version, demo frame, smoke **11/11** | version, demo frame, smoke **13/13** — see below |
 
 Backend coverage behind those numbers:
 
@@ -198,6 +198,13 @@ Backend coverage behind those numbers:
 | btrfs section covers | `/srv/data`, **not** the root | `/` | `/` |
 | devices parsed | 7, matching `lsblk` | 7, matching `lsblk` | 6, matching `lsblk` |
 | tui-disk backend versions | util-linux 2.39.3, btrfs-progs 6.6.3 | util-linux 2.41.5, btrfs-progs 6.19.1 | util-linux 2.42.2, btrfs-progs 7.1 |
+| tui-update manager | `apt` | `dnf` | `pacman` |
+| tui-update backend version | apt 2.8.3 | dnf 5.4.1 | pacman 7.1.0 |
+| pending list read with | `apt list --upgradable` | `dnf check-update` | **`pacman -Qu`** (no `fakeroot`) |
+| pending count | 12, matching apt | 184, matching dnf | 0, matching pacman |
+| restart classifier | `needrestart` | `needs-restarting` (**absent**) | `omarchy-server-update-restart` |
+| snapshot before upgrade | none (no snapper root config) | none (no snapper root config) | `snapper` config `root` |
+| unattended-update unit | `apt-daily-upgrade.timer`, enabled | `dnf-automatic.timer`, **not-found** | `omarchy-server-update.timer`, disabled |
 | SMART | none: virtio disks carry none, and no guest has smartmontools | same | same |
 
 ### Omarchy and `tui-snapper`
@@ -242,7 +249,7 @@ The other three each had a bug, and in all three cases the bug was in the **test
 
 ### Omarchy and `tui-update`
 
-`tui-update` is the one tool the lab currently fails, and it fails on the machine it most needs to work on. Omarchy Server 4.0.1 ships `checkupdates` — it comes with `pacman-contrib` — but **not `fakeroot`**, which `checkupdates` needs to build its temporary database. So:
+`tui-update` was the one tool the lab failed, and it failed on the machine it most needs to work on. Omarchy Server 4.0.1 ships `checkupdates` — it comes with `pacman-contrib` — but **not `fakeroot`**, which `checkupdates` needs to build its temporary database. So:
 
 ```console
 $ tui-update --check
@@ -250,11 +257,16 @@ tui-update: pacman read failed: `/usr/bin/sudo -n checkupdates` failed:
 ==> ERROR: Cannot find the fakeroot binary
 ```
 
-`--check` exits 1 and the whole report is empty, which takes ten of the twelve assertions down with it — the pending count, the restart class, the snapshot support the machine really does have, the pacman log. Only `--version` and the `--demo` frame pass.
+`--check` exited 1 and the whole report was empty, which took ten of the twelve assertions down with it — the pending count, the restart class, the snapshot support the machine really does have, the pacman log. Only `--version` and the `--demo` frame passed.
 
-Nothing about that is the lab's doing: it is the shipped image, unmodified, which is the entire point of the Omarchy VM. Either `checkupdates` needs a fallback for a machine without `fakeroot`, or the read needs to degrade to a reported reason instead of failing the whole model — a machine whose update count cannot be determined still has a snapshot configuration, a timer and a history worth showing. That is `tui-update`'s call to make; the lab's job was to find it, and the result is recorded here rather than smoothed over.
+Nothing about that was the lab's doing: it is the shipped image, unmodified, which is the entire point of the Omarchy VM. The fix took both of the routes the failure suggested. `checkupdates` is now chosen only when `fakeroot` is on `PATH`, and the pending list falls back to `pacman -Qu` with a note saying why it may be stale; and the pending list is a *section* of the model rather than its precondition, so a machine whose update count cannot be read still shows its snapshot configuration, its timer and its history, with the reason in place of the count. `--check` grew a `pendingError` field so the difference between "nothing pending" and "could not tell" is machine-readable, and the smoke test asserts it is absent.
 
-Ubuntu (apt 2.8.3) and Fedora (dnf 5.4.1) pass 11/11 and 10/10. Fedora skips one: `needs-restarting` lives in `dnf-plugins-core`, which the Cloud image leaves out.
+Two more things only the real image would have shown, both fixed with fixtures captured from it:
+
+- **`pacman -Qu` exits non-zero when nothing is upgradable**, and on a machine that has never run a `pacman -Sy` it prints a warning per repository instead of a package list. Empty output was already treated as "up to date"; five warning lines and exit 1 were not, so the fallback failed exactly where it was needed.
+- **A pacman history is a log of invocations, not of transactions.** One `omarchy-server-update run` runs pacman three times — a bare `-Sy`, a keyring refresh, then the upgrade — so two of every three rows on the history screen had an empty detail column. Runs that changed no package are now dropped, which is what apt and dnf list anyway.
+
+Omarchy now passes **13/13**, skipping one: a cloud image built by installing into a chroot has no `/var/log/pacman.log` until its first upgrade. Running a real `omarchy-server-update run --no-reboot` on the guest gives it one, and the suite is 14/14 from there. Ubuntu (apt 2.8.3) and Fedora (dnf 5.4.1) pass 12/12 and 11/11; Fedora skips one, because `needs-restarting` lives in `dnf-plugins-core`, which the Cloud image leaves out.
 
 One gap the lab cannot close: **no guest has SMART**. Every disk is virtio, none of the three images ships `smartmontools`, so `tui-disk`'s health read is asserted only in its absence — each drive must come back `unknown` *with a reason*, which is at least distinguishable from a read the tool forgot to make.
 
