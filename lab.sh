@@ -12,7 +12,7 @@
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
-#   lab.sh router up|down|status|test
+#   lab.sh router up|down|status|test [--via-tool [PATH]]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -955,6 +955,8 @@ packages:
   - conntrack
   - tcpdump
   - curl
+  # tmux is the pty `router test --via-tool` drives the real TUI through.
+  - tmux
 write_files:
   - path: /etc/sysctl.d/99-tui-lab-router.conf
     content: |
@@ -1187,6 +1189,20 @@ rt_curl() { # rt_curl <vm> <url> — short timeout, so a dropped packet fails fa
 }
 
 cmd_router_test() {
+  local via_tool=0 bin=""
+  while (($#)); do
+    case "$1" in
+      --via-tool)
+        via_tool=1; shift
+        # The path is optional: without one the binary is built from the
+        # sibling checkout, whatever branch it happens to be on.
+        if [[ ${1:-} && ${1:0:1} != - ]]; then bin="$1"; shift; fi
+        ;;
+      *) die "router test: unknown option: $1" ;;
+    esac
+  done
+  if ((via_tool)); then cmd_router_test_via_tool "$bin"; return; fi
+
   local role
   for role in router lan-client wan-host; do
     vm_running "$role" || die "$role is not running (lab.sh router up)"
@@ -1349,13 +1365,455 @@ sudo -n nft add rule ip lab filter_fwd iifname \"lan0\" oifname \"wan0\" counter
   return $rt_rc
 }
 
+# ---------------------------------------------------------------------------
+# The TUI driver: keys in, panes out
+# ---------------------------------------------------------------------------
+# `router test --via-tool` proves the same things the hand-written rulesets
+# above prove, except that every rule is written by a human-shaped sequence of
+# key presses into the real tui-firewall running on the router. There is no
+# batch or apply flag anywhere in the family, on purpose: a non-interactive
+# mutation path would go around the preview-and-confirm dialog that is the
+# whole point of these tools. So the lab drives the terminal.
+#
+# tmux is the pty. The tool runs in a detached session on the guest,
+# `send-keys` types into it and `capture-pane` reads the screen back as plain
+# text, which is both what the driver makes decisions on and what the run
+# records as evidence.
+#
+# Two details cost time to find:
+#
+#   * The tools query the terminal for its background colour (OSC 11) at
+#     startup and only draw once it has answered or the probe gives up, which
+#     is what render-screenshots.py in the kit answers by hand. tmux answers
+#     it, so the frame arrives in about a second — but keys sent before it
+#     are swallowed by the reader waiting for that answer. Every step here
+#     waits for the screen it expects before typing into it, starting with
+#     the first frame.
+#   * A tmux server started from an ssh command lives inside that login
+#     session's scope, and logind takes the scope down when the connection
+#     closes. `loginctl enable-linger` is what keeps the server alive between
+#     the driver's ssh calls.
+tui_vm=""
+tui_session="tui-drive"
+# Where the binary under test lands in the guest.
+tui_bin_path="/tmp/tui-firewall-drive"
+tui_shots=""
+tui_shot_n=0
+
+# tui_start launches the tool in a detached tmux session and waits for the
+# first drawn frame. The pane is 160x45: the confirm dialog holds a whole nft
+# command line and the evidence is worth nothing if the command is truncated.
+tui_start() {
+  tui_vm="$1"; shift
+  local cmd="$*"
+  vm_ssh "$tui_vm" "command -v tmux >/dev/null 2>&1 || { sudo -n apt-get update -qq >/dev/null 2>&1; sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux >/dev/null 2>&1; }"
+  vm_ssh "$tui_vm" "command -v tmux >/dev/null" || die "tmux could not be installed on $tui_vm"
+  vm_ssh "$tui_vm" "sudo -n loginctl enable-linger $lab_user >/dev/null 2>&1 || true"
+  vm_ssh "$tui_vm" "tmux kill-session -t $tui_session 2>/dev/null; sleep 1; tmux new-session -d -s $tui_session -x 160 -y 45 '$cmd'; sleep 1; tmux ls" >/dev/null \
+    || die "could not start tmux on $tui_vm"
+  printf '\n$ [%s] tmux new-session %s\n' "$tui_vm" "$cmd" >>"$rt_log"
+}
+
+# tui_stop quits the tool the way a user does and tears the session down.
+tui_stop() {
+  [[ -n $tui_vm ]] || return 0
+  vm_ssh "$tui_vm" "tmux send-keys -t $tui_session q 2>/dev/null; sleep 1; tmux kill-session -t $tui_session 2>/dev/null; true" >/dev/null 2>&1 || true
+}
+
+# tui_pane returns what is on the screen right now, as plain text.
+tui_pane() {
+  vm_ssh "$tui_vm" "tmux capture-pane -p -t $tui_session" 2>/dev/null
+}
+
+# tui_shot records the screen as a numbered file under the evidence directory
+# and names it in the log. Every confirm dialog goes through here before the
+# key that accepts it: the preview is the evidence.
+tui_shot() {
+  local name="$1" file
+  tui_shot_n=$((tui_shot_n + 1))
+  file="$(printf '%s/%02d-%s.txt' "$tui_shots" "$tui_shot_n" "$name")"
+  tui_pane >"$file"
+  {
+    echo "--- pane: $name ($(basename "$file"))"
+    sed 's/^/  /' "$file"
+  } >>"$rt_log"
+}
+
+# tui_wait_for polls the pane until it shows a string, and fails the run with
+# the screen it was looking at when it does not.
+tui_wait_for() {
+  local needle="$1" limit="${2:-30}" i pane
+  for ((i = 0; i < limit * 2; i++)); do
+    pane="$(tui_pane)"
+    if [[ $pane == *"$needle"* ]]; then return 0; fi
+    sleep 0.5
+  done
+  tui_shot "stuck-waiting-for-${needle//[^A-Za-z0-9]/-}"
+  rt_say "FAIL  the TUI never showed \"$needle\" (pane captured above)"
+  rt_rc=1
+  return 1
+}
+
+# tui_wait_gone is the other half: poll until a string leaves the screen. It
+# is how the driver knows a confirmed command finished, because the status
+# line says "running …" until it has.
+tui_wait_gone() {
+  local needle="$1" limit="${2:-30}" i
+  for ((i = 0; i < limit * 2; i++)); do
+    [[ $(tui_pane) == *"$needle"* ]] || return 0
+    sleep 0.5
+  done
+  return 0
+}
+
+# tui_keys sends named keys, one at a time with a beat between them, in one
+# round trip. Bubble Tea reads a burst of keys as a burst, and a form that
+# moves the cursor on every one of them needs them separated.
+tui_keys() {
+  vm_ssh "$tui_vm" "for k in $*; do tmux send-keys -t $tui_session \"\$k\"; sleep 0.25; done" >/dev/null
+  printf '  keys: %s\n' "$*" >>"$rt_log"
+}
+
+# tui_type types literal text. The values this lab types are addresses,
+# interface names and alias names; anything with a quote in it would have to
+# survive two shells and a tmux argument, and refusing it here is better than
+# discovering it in a rule.
+tui_type() {
+  local text="$1"
+  [[ $text =~ ^[A-Za-z0-9@._:/,\ -]*$ ]] || die "tui_type: refusing to type $text"
+  vm_ssh "$tui_vm" "tmux send-keys -t $tui_session -l -- '$text'; sleep 0.4" >/dev/null
+  printf '  type: %s\n' "$text" >>"$rt_log"
+}
+
+# tui_pick chooses an entry in an open picker by its label: home, then down
+# until the highlight marker sits on it. Counting key presses would work until
+# the day the backend adds an action, and then it would work wrongly.
+tui_pick() {
+  local label="$1" i pane
+  tui_wait_for "$label" 20 || return 1
+  tui_keys Home
+  for ((i = 0; i < 30; i++)); do
+    pane="$(tui_pane)"
+    if [[ $pane == *"> $label"* ]]; then
+      tui_keys Enter
+      return 0
+    fi
+    tui_keys Down
+  done
+  tui_shot "stuck-picking-${label//[^A-Za-z0-9]/-}"
+  rt_say "FAIL  could not put the picker on \"$label\" (pane captured above)"
+  rt_rc=1
+  return 1
+}
+
+# tui_focus moves the add-rule form to a field by its label, the same way.
+tui_focus() {
+  local label="$1" i pane
+  for ((i = 0; i < 16; i++)); do
+    pane="$(tui_pane)"
+    if [[ $pane == *"> $label"* ]]; then return 0; fi
+    tui_keys Tab
+  done
+  tui_shot "stuck-on-field-${label//[^A-Za-z0-9]/-}"
+  rt_say "FAIL  the form never focused \"$label\" (pane captured above)"
+  rt_rc=1
+  return 1
+}
+
+# tui_confirm captures the confirm dialog, checks that it really is showing a
+# command, accepts it and waits for the tool to come back to the table with
+# the change applied.
+tui_confirm() {
+  local name="$1" pane
+  tui_wait_for "Command to run:" 20 || return 1
+  tui_shot "$name-preview"
+  pane="$(tui_pane)"
+  tui_keys y
+  tui_wait_for "x actions" 30 || return 1
+  # The status line says "running …" until the command comes back, and the
+  # table behind it is only the new one after the reload that follows.
+  tui_wait_gone "running " 60
+  sleep 1
+  tui_shot "$name-after"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# router test --via-tool: the proofs, mirrored through the TUI
+# ---------------------------------------------------------------------------
+# Every network probe below is the one the hand-written run already uses. What
+# changes is who wrote the rule: there, a heredoc of nft; here, the add-rule
+# form, the actions menu and the policy picker of the real tool.
+
+# rtt_nft reads the tool's own table back, as the check that the keys landed.
+rtt_nft() { rt_run router "sudo -n nft list ruleset"; }
+
+cmd_router_test_via_tool() {
+  local bin="$1"
+  local role
+  for role in router lan-client wan-host; do
+    vm_running "$role" || die "$role is not running (lab.sh router up)"
+  done
+  build_tool tui-firewall "$bin"
+  bin="$tool_bin"
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-router-via-tool"
+  tui_shots="$logdir/panes"
+  mkdir -p "$tui_shots"
+  rt_log="$logdir/via-tool.log"
+  rt_rc=0
+  {
+    echo "### router topology, driven through tui-firewall — $(date -Is)"
+    echo "wan $router_wan_net: router $router_wan_ip, wan-host $wan_host_ip:$wan_host_port"
+    echo "lan $router_lan_net: router $router_lan_ip, lan-client $lan_client_ip:$lan_client_port"
+    echo "binary: $bin"
+  } >"$rt_log"
+
+  log "shipping $bin to the router"
+  # A path of its own, and unlinked before it is written: `lab.sh test` ships
+  # a tui-firewall of its own into this guest, and a binary that is currently
+  # running cannot be overwritten in place (ETXTBSY) — but it can be replaced.
+  vm_ssh router "rm -f $tui_bin_path"
+  vm_scp router "$bin" "$tui_bin_path" >/dev/null
+  vm_ssh router "chmod +x $tui_bin_path"
+  rt_run router "$tui_bin_path --version" >/dev/null
+
+  # The run starts from the machine `up` hands over: forwarding on, nothing
+  # loaded. Everything after this line is written by the TUI.
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+
+  local body ok
+  tui_start router "TERM=xterm-256color $tui_bin_path --backend nftables"
+  tui_wait_for "x actions" 45 || { tui_stop; return 1; }
+  tui_shot "01-first-frame"
+
+  # -- 1. the tool builds its own table ------------------------------------
+  # An nftables backend that wrote into somebody else's table would be lost at
+  # the next reload of whatever owns it, so the tool owns one and creates it
+  # from the actions menu. Which makes this the first mutation to mirror.
+  tui_keys x
+  tui_pick "Create inet tui, the table this tool owns" && tui_confirm "create-table"
+  tui_keys x
+  tui_pick "Create the input, forward and output chains" && tui_confirm "create-filter-chains"
+  tui_keys x
+  tui_pick "Create the prerouting and postrouting NAT chains" && tui_confirm "create-nat-chains"
+
+  body="$(rtt_nft)" || true
+  ok=1
+  grep -q "table inet tui" <<<"$body" \
+    && grep -q "hook input" <<<"$body" && grep -q "hook forward" <<<"$body" \
+    && grep -q "hook output" <<<"$body" && grep -q "hook prerouting" <<<"$body" \
+    && grep -q "hook postrouting" <<<"$body" && ok=0
+  rt_verdict "the TUI created table inet tui with its five chains" "$ok"
+
+  # -- 2. an input rule, added and deleted in the TUI (mirrors 12 and 13) ---
+  ok=0; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=1
+  rt_verdict "before the rule, wan-host reaches the router" "$ok"
+
+  tui_keys v; tui_pick "inet tui / input" || true
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "DENY"
+  tui_focus "From" && tui_type "$wan_host_ip"
+  tui_focus "Comment" && tui_type "lab: input proof"
+  tui_shot "input-rule-form"
+  tui_keys Enter
+  tui_confirm "input-rule-add"
+
+  body="$(rtt_nft)" || true
+  ok=1; grep -q "ip saddr $wan_host_ip .*drop" <<<"$body" && ok=0
+  rt_verdict "the rule the form wrote is in the ruleset, as a drop on wan-host's address" "$ok"
+
+  ok=1; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=0
+  rt_verdict "a rule added in the TUI blocks wan-host from reaching the router" "$ok"
+
+  tui_keys d
+  tui_confirm "input-rule-delete"
+  ok=0; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=1
+  rt_verdict "deleting that rule in the TUI lets wan-host reach the router again" "$ok"
+
+  # -- 3. an output rule on the router itself (mirrors 14) -----------------
+  ok=0; rt_curl router "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "before the rule, the router reaches the service on wan-host" "$ok"
+
+  tui_keys v; tui_pick "inet tui / output" || true
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "REJECT"
+  tui_focus "Port(s)" && tui_type "$wan_host_port"
+  tui_focus "Protocol" && tui_keys Enter && tui_pick "tcp"
+  tui_focus "To" && tui_type "$wan_host_ip"
+  tui_focus "Comment" && tui_type "lab: output proof"
+  tui_keys Enter
+  tui_confirm "output-rule-add"
+
+  ok=1; rt_curl router "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "an output rule added in the TUI blocks the router's own traffic to wan-host" "$ok"
+
+  tui_keys d
+  tui_confirm "output-rule-delete"
+  ok=0; rt_curl router "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "deleting it lets the router out again" "$ok"
+
+  # -- 4. masquerade from the actions menu (mirrors 5, 6 and 7) -------------
+  ok=1; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "before the masquerade, lan-client cannot reach wan-host" "$ok"
+
+  rt_run wan-host "sudo -n truncate -s 0 /var/log/wan-http.log" >/dev/null
+  tui_keys x
+  tui_pick "Masquerade everything leaving an interface" || true
+  tui_wait_for "Outgoing interface" 20 && tui_type "wan0" && tui_keys Enter
+  tui_confirm "masquerade"
+
+  ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "with the masquerade the TUI wrote, lan-client reaches wan-host" "$ok"
+
+  body="$(rt_run wan-host "sudo -n cat /var/log/wan-http.log")" || true
+  ok=1
+  grep -q "^$router_wan_ip " <<<"$body" && ! grep -q "$lan_client_ip" <<<"$body" && ok=0
+  rt_verdict "wan-host logged the router's wan address, not the client's" "$ok"
+
+  # -- 5. forward policy and a forward rule (mirrors 9, 10 and 11) ----------
+  tui_keys v; tui_pick "inet tui / forward" || true
+  tui_keys p
+  tui_pick "routed" || true
+  tui_pick "deny" || true
+  tui_confirm "forward-policy-drop"
+
+  ok=1; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "the forward policy the TUI set to deny stops LAN to WAN traffic" "$ok"
+
+  # Two rules where the hand-written run needs one: the form has no
+  # conntrack state field, so the way back is a rule of its own.
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "From" && tui_type "$router_lan_net"
+  tui_focus "Comment" && tui_type "lab: lan out"
+  tui_keys Enter
+  tui_confirm "forward-rule-out"
+
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "To" && tui_type "$router_lan_net"
+  tui_focus "Comment" && tui_type "lab: lan back"
+  tui_keys Enter
+  tui_confirm "forward-rule-back"
+
+  ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "the forward rules the TUI wrote let LAN to WAN through" "$ok"
+
+  body="$(rt_run router "sudo -n nft list chain inet tui forward")" || true
+  ok=1
+  [[ $(grep "ip saddr $router_lan_net" <<<"$body" | sed -n 's/.*counter packets \([0-9]*\).*/\1/p') -gt 0 ]] && ok=0
+  rt_verdict "the forward rule's packet counter moved" "$ok"
+
+  tui_keys p
+  tui_pick "routed" || true
+  tui_pick "allow" || true
+  tui_confirm "forward-policy-accept"
+
+  # -- 6. a port forward, added and deleted in the NAT view (mirrors 17-19) -
+  ok=1; rt_curl wan-host "http://$router_wan_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "before the port forward, the router's wan address serves nothing" "$ok"
+
+  tui_keys v; tui_pick "NAT" || true
+  tui_keys x
+  tui_pick "Forward a port to a host behind the router" || true
+  tui_wait_for "Incoming interface" 20 && tui_type "wan0" && tui_keys Enter
+  tui_pick "tcp" || true
+  tui_wait_for "Port on this machine" 20 && tui_type "$wan_host_port" && tui_keys Enter
+  tui_wait_for "Host to forward to" 20 && tui_type "$lan_client_ip" && tui_keys Enter
+  tui_wait_for "Port on that host" 20 && tui_type "$lan_client_port" && tui_keys Enter
+  tui_confirm "port-forward"
+
+  ok=0
+  rt_curl wan-host "http://$router_wan_ip:$wan_host_port/" | grep -q 'lan-client service' || ok=1
+  rt_verdict "the port forward the TUI wrote exposes lan-client on the router's wan address" "$ok"
+
+  # The NAT view holds the masquerade as well, so the row to delete is picked
+  # the way a user picks it: filter down to the forward, then d.
+  tui_keys "/"
+  tui_type "$lan_client_ip"
+  tui_keys Enter
+  tui_shot "port-forward-filtered"
+  tui_keys d
+  tui_confirm "port-forward-delete"
+  tui_keys "/" Escape
+
+  ok=1; rt_curl wan-host "http://$router_wan_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "deleting it in the TUI closes the port forward again" "$ok"
+
+  # -- 7. an alias, round trip (mirrors 15 and 16) -------------------------
+  tui_keys x
+  tui_pick "Create an alias (a named set)" || true
+  tui_wait_for "Alias name" 20 && tui_type "hostile" && tui_keys Enter
+  tui_pick "ipv4_addr" || true
+  tui_pick "yes" || true
+  tui_wait_for "Comment" 20 && tui_type "lab: alias proof" && tui_keys Enter
+  tui_confirm "alias-create"
+
+  tui_keys x
+  tui_pick "Add a member to an alias" || true
+  tui_pick "hostile" || true
+  tui_wait_for "Member" 20 && tui_type "$wan_host_ip" && tui_keys Enter
+  tui_confirm "alias-add-member"
+
+  tui_keys v; tui_pick "inet tui / input" || true
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "DENY"
+  tui_focus "Alias (source)" && tui_keys Enter && tui_pick "@hostile"
+  # An inet table holds both address families, so a rule whose only match is
+  # an alias has to say which one it means; the form has the field.
+  tui_focus "Family" && tui_keys Enter && tui_pick "v4"
+  tui_focus "Comment" && tui_type "lab: alias rule"
+  tui_shot "alias-rule-form"
+  tui_keys Enter
+  tui_confirm "alias-rule-add"
+
+  body="$(rtt_nft)" || true
+  ok=1; grep -q "@hostile" <<<"$body" && ok=0
+  rt_verdict "the rule the TUI wrote matches the alias by name" "$ok"
+
+  ok=1; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=0
+  rt_verdict "a rule matching the alias blocks the address in it" "$ok"
+
+  tui_keys x
+  tui_pick "Remove a member from an alias" || true
+  tui_pick "hostile" || true
+  tui_wait_for "Member" 20 && tui_type "$wan_host_ip" && tui_keys Enter
+  tui_confirm "alias-remove-member"
+
+  ok=0; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=1
+  rt_verdict "emptying the alias in the TUI propagates, without touching the rule" "$ok"
+
+  body="$(rtt_nft)" || true
+  ok=1; grep -q "@hostile" <<<"$body" && ok=0
+  rt_verdict "the rule that used the alias is still there" "$ok"
+
+  # -- done: leave the machine as `up` handed it over ----------------------
+  tui_stop
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+
+  echo
+  if ((rt_rc)); then
+    rt_say "VERDICT  router topology through the TUI: FAIL"
+  else
+    rt_say "VERDICT  router topology through the TUI: PASS"
+  fi
+  log "evidence: $rt_log"
+  log "panes: $tui_shots"
+  return $rt_rc
+}
+
 cmd_router() {
   local sub="${1:?up|down|status|test}"; shift || true
   case "$sub" in
     up) cmd_router_up "$@" ;;
     down) cmd_router_down ;;
     status) cmd_router_status ;;
-    test) cmd_router_test ;;
+    test) cmd_router_test "$@" ;;
     *) die "router: expected up, down, status or test" ;;
   esac
 }

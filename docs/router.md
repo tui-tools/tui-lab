@@ -105,17 +105,148 @@ without any rule being rewritten.
 
 The router is left as `up` handed it over, forwarding on and ruleset empty.
 
+## The same proofs, written by the real TUI
+
+`lab.sh router test --via-tool [PATH]` runs a second suite in which not one
+rule is written by this script. Every mutation is typed into the real
+`tui-firewall` running on the router: the add-rule form, the actions menu, the
+policy picker and the delete dialog, key by key, with the confirm dialog
+answered the way a person answers it. The network probes are the same ones the
+hand-written suite uses, so the two suites are comparable line by line.
+
+There is no batch or apply flag to reach for, in this tool or in any other in
+the family, and there should not be: a non-interactive mutation path would go
+around the preview-and-confirm dialog that is the reason these tools exist. So
+the lab drives the terminal instead.
+
+### The driver
+
+`tmux` is the pty. The tool runs in a detached session on the guest,
+`send-keys` types into it, and `capture-pane` reads the screen back as plain
+text — which is both what the driver makes its decisions on and what the run
+files away as evidence.
+
+| Helper | What it does |
+|--------|--------------|
+| `tui_start <vm> <cmd…>` | installs tmux if the guest has none, starts the session at 160x45 and waits for the first drawn frame |
+| `tui_keys <keys…>` | sends named keys one at a time, with a beat between them, in one ssh round trip |
+| `tui_type <text>` | types literal text, refusing anything that would not survive two shells and a tmux argument |
+| `tui_wait_for` / `tui_wait_gone` | polls the pane until a string appears or leaves; a timeout captures the screen and fails the run |
+| `tui_pick <label>` | chooses an entry in an open picker by its label: home, then down until the highlight sits on it |
+| `tui_focus <label>` | moves the add-rule form to a field by its label |
+| `tui_confirm <name>` | captures the confirm dialog, checks it is really showing a command, answers `y` and waits for the reload |
+| `tui_shot <name>` | files the screen under `panes/` and quotes it into the run log |
+
+Nothing counts key presses. A picker is driven until the marker sits on the
+label that was asked for, and a form field is tabbed to until the cursor is on
+it: counting would work until the day the backend adds an action, and then it
+would work wrongly.
+
+`tui_confirm` captures the dialog **before** answering it. The preview is the
+evidence: what the run proves is that the keys a person would press produced
+that exact `nft` command line, and that the command line then changed the
+network.
+
+Three things cost time to find here:
+
+- **The OSC 11 quirk.** The tools ask the terminal for its background colour
+  at startup and only draw once it has answered or the probe gives up — the
+  same query `render-screenshots.py` in the kit answers by hand. tmux answers
+  it, so the first frame arrives in about a second; but keys sent before it
+  are eaten by the reader waiting for that answer. Every step waits for the
+  screen it expects before typing into it, starting with the first frame.
+- **A tmux server started from an ssh command dies with the login session.**
+  It lives inside that session's scope, and logind takes the scope down when
+  the connection closes, which shows up much later as `no server running`.
+  `loginctl enable-linger` is what keeps it alive between the driver's calls.
+- **A running binary cannot be overwritten in place.** `lab.sh test` ships a
+  `tui-firewall` of its own into this guest, so the driven one has a path of
+  its own and is unlinked before it is written.
+
+### What it mirrors
+
+The tool owns one table, `inet tui`, and writes nowhere else, so the run
+begins by creating it and its five chains — from the actions menu, with the
+same preview and confirm as everything after it.
+
+| # | Check through the TUI | Mirrors |
+|---|-----------------------|---------|
+| 1 | The actions menu created `inet tui` with its five chains | — |
+| 2 | Before the rule, `wan-host` reaches the router | 12 |
+| 3 | The rule the form wrote is in the ruleset, as a drop on `wan-host`'s address | 12 |
+| 4 | A rule added in the TUI blocks `wan-host` from reaching the router | 12 |
+| 5 | Deleting it in the TUI restores the reach | 13 |
+| 6 | Before the rule, the router reaches the service on `wan-host` | 14 |
+| 7 | An output rule added in the TUI blocks the router's own traffic | 14 |
+| 8 | Deleting it lets the router out again | — |
+| 9 | Before the masquerade, `lan-client` cannot reach `wan-host` | 5 |
+| 10 | With the masquerade the TUI wrote, it can | 6 |
+| 11 | `wan-host` logged the router's wan address, not the client's | 7 |
+| 12 | The forward policy the TUI set to deny stops LAN to WAN traffic | 9 |
+| 13 | The forward rules the TUI wrote let it through | 10 |
+| 14 | That rule's packet counter moved | 11 |
+| 15 | Before the port forward, the router's wan address serves nothing | 17 |
+| 16 | The port forward the TUI wrote exposes `lan-client` on it | 18 |
+| 17 | Deleting it in the TUI closes it again | 19 |
+| 18 | The rule the TUI wrote matches the alias by name | 15 |
+| 19 | A rule matching the alias blocks the address in it | 15 |
+| 20 | Emptying the alias in the TUI propagates, without touching the rule | 16 |
+| 21 | The rule that used the alias is still there | 16 |
+
+Evidence lands under `out/results/<stamp>-router-via-tool/`: the run log with
+every key sequence, every pane and every probe, and `panes/` with the screens
+themselves, numbered in the order they were taken.
+
+### What the UI could not express
+
+Two mirrored checks are not written the way the hand-written suite writes
+them, and both differences are the tool's, not the lab's:
+
+- **Check 12** blocks `wan-host` with `iifname "wan0" … icmp type
+  echo-request drop`. The add-rule form has no interface field and its
+  protocol choice is `tcp` or `udp`, so the rule the TUI can write is `ip
+  saddr 10.90.0.20 counter drop` — everything from that host, rather than its
+  pings arriving on that interface. The probe is the same and so is the
+  verdict; the rule is blunter.
+- **Check 10** lets the LAN out with one stateful pair, `ct state
+  established,related accept` plus `iifname "lan0" oifname "wan0" accept`.
+  The form has no connection-state field, so the way out and the way back are
+  two stateless rules: `ip saddr 10.91.0.0/24 accept` and `ip daddr
+  10.91.0.0/24 accept`.
+
+What the phase-1 UI does not expose at all, and what a rule editor for a
+router eventually needs:
+
+| Missing | Consequence here |
+|---------|------------------|
+| An interface match on a filter rule (`iifname`, `oifname`) | Rules are scoped by address only; masquerade and port forward do take an interface |
+| A connection-state match (`ct state`) | No stateful rule from the UI; return traffic needs a rule of its own |
+| Protocols beyond `tcp` and `udp` | No ICMP rule, so "stop this host pinging me" has to be "stop this host" |
+| Deleting the tool's own table or chains | The actions menu creates them and nothing removes them; the run flushes the ruleset over ssh at the end |
+| A source-scoped masquerade | The action masquerades everything leaving an interface, not one network behind it |
+
+Everything else the acceptance needs is there: rules in the input, forward and
+output views, chain policies, masquerade, port forwards, aliases and their
+members, and delete for each of them.
+
 ## Usage
 
 ```bash
 ./lab.sh router up          # boots router, wan-host, lan-client in that order
 ./lab.sh router status      # pids, ssh ports, link sockets, addresses per guest
 ./lab.sh router test        # the checks above, PASS/FAIL, evidence under out/results/
+./lab.sh router test --via-tool ../tui-firewall/tui-firewall
+                            # the same proofs, typed into the real TUI
 ./lab.sh router down
 ```
 
 `lab.sh ssh router …`, `lab.sh ssh lan-client …` and `lab.sh ssh wan-host …`
 work the way they do for any other VM.
+
+`--via-tool` takes an optional path. Without one the binary is built from the
+sibling `tui-firewall` checkout, whatever branch it is on; with one, any
+binary can be driven, which is how a branch that is not checked out next door
+gets tested.
 
 ## What this does not cover
 
