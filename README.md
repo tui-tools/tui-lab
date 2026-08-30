@@ -3,7 +3,7 @@
 
 A small, reproducible multi-distro lab for the [tui-tools](https://github.com/tui-tools) family.
 
-The tools in this family drive real system backends: `ufw`, `firewalld`, `systemctl`, `journalctl`, `snapper`. Unit tests cover the parsers against captured output, and `--demo` covers the UI against a fake. Neither answers the question that actually breaks in the field: **does the tool read this machine correctly?**
+The tools in this family drive real system backends: `ufw`, `firewalld`, `systemctl`, `journalctl`, `snapper`, `networkctl`. Unit tests cover the parsers against captured output, and `--demo` covers the UI against a fake. Neither answers the question that actually breaks in the field: **does the tool read this machine correctly?**
 
 `tui-lab` answers it. It boots stock cloud images headless under QEMU/KVM, seeds them with cloud-init so each one has the package manager and the backend a real user would have, builds a tool from its sibling checkout, copies the binary in, and runs the tool's own smoke test against the live backend.
 
@@ -144,6 +144,7 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
 ./lab.sh test tui-firewall
 ./lab.sh test tui-systemd
 ./lab.sh test tui-snapper
+./lab.sh test tui-network
 ./lab.sh all down
 ```
 
@@ -152,6 +153,7 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
 | **tui-firewall** | version, demo frame, smoke **5/5** | version, demo frame, smoke **3/3** | version, demo frame, smoke **5/5** |
 | **tui-systemd** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** |
 | **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **15/15** | version, demo frame, smoke **17/17** |
+| **tui-network** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** |
 
 Backend coverage behind those numbers:
 
@@ -167,6 +169,12 @@ Backend coverage behind those numbers:
 | tui-snapper config | `data` on `/srv/data` | `data` on `/srv/data` | `root` on `/` |
 | rollback mechanism | `unsupported` (not the root fs) | `unsupported` (not the root fs) | `boot-menu`, from `/boot/limine.conf` |
 | boot entries parsed | — | — | 5, matching the `///` nodes in `limine.conf` |
+| tui-network manager | `systemd-networkd` | **NetworkManager** | `systemd-networkd` |
+| tui-network backend version | `systemd 255` | `systemd 259` | `systemd 261` |
+| links parsed | 2, matching `networkctl list` | 2, matching `networkctl list` | 2, matching `networkctl list` |
+| routes parsed | 4, matching `ip -j route` | 2, matching `ip -j route` | 4, matching `ip -j route` |
+| managed links | 1 | **0**, every link read-only | 1 |
+| `.network` file of the managed link | `/run/systemd/network/10-netplan-enp0s4.network` | — | `/etc/systemd/network/20-wired.network` |
 
 ### Omarchy and `tui-snapper`
 
@@ -175,6 +183,14 @@ The Omarchy VM is the only machine in the lab that rolls back from the boot menu
 That run found a real bug on the first attempt. `/boot` is the mounted ESP, **mode 0700 and owned by root**, so an unprivileged `tui-snapper` could not open `limine.conf` at all: it reported a machine with a full boot menu as having none, and named the wrong rollback mechanism as a result. Every unit test had passed, because a fixture on disk is readable. The tool now escalates that read the same way it escalates its snapper calls.
 
 The same run also corrected the tool's fixtures. `limine-snapper-sync` on Omarchy Server 4.0.1 titles its entries `4 │ 2026-08-29 21:27:27` — the snapshot number, a U+2502 separator, then the timestamp — where the reconstruction had assumed the timestamp alone. The captured file now lives in `tui-snapper/internal/snapper/testdata/limine-omarchy-server.conf`.
+
+### Ubuntu and `tui-network`
+
+The Ubuntu VM is the only machine in the lab configured by **netplan**, and that is what made it worth running. netplan does not write `.network` files where a user would; it renders them into `/run/systemd/network` as **mode 0640, owned `root:systemd-network`**. So the one file that configures the machine's only managed link is the one file an unprivileged `tui-network` cannot open.
+
+The tool listed the seven world-readable templates systemd ships in `/usr/lib/systemd/network` and silently dropped that one — a non-zero count of `.network` files, none of them the file the editor exists to edit. The first smoke test passed anyway, because it only asked whether *a* file was found. It now asks `networkctl` which file configures the managed link and demands that exact path back, plus its contents; and the tool escalates the read with `sudo -n cat` when the plain read hits `EACCES`, the same fallback `tui-snapper` grew for `/boot`.
+
+The run also gave the tool its first fixtures captured from real machines, one per systemd generation, with QEMU's addresses rewritten into the documentation ranges. They are not the same shape: **systemd 261** adds a top-level `Routes` array, an `AddressString`/`DestinationString` rendering beside every byte array, and a fully decoded DHCP `Message` inside the lease, where **systemd 255** has none of them. Both now live in `tui-network/internal/networkd/testdata/networkctl-{list,status}-systemd{255,261}.json`.
 
 ### Fedora and `tui-firewall`
 
