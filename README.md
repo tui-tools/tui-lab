@@ -14,7 +14,7 @@ It is glue, so it is one bash script.
 | VM | Image | Firewall | Snapshots | Notes |
 |----|-------|----------|-----------|-------|
 | `ubuntu` | Ubuntu 24.04 LTS cloud image | `ufw`, enabled with 22 allowed | `snapper` on a btrfs data disk | **Root is ext4**, so snapper gets `/dev/vdb` |
-| `fedora` | Fedora Cloud Base Generic 44 | `firewalld`, installed by the seed | `snapper` on a btrfs data disk | **Root is btrfs**; SELinux **enforcing** |
+| `fedora` | Fedora Cloud Base Generic 44 | `firewalld`, installed by the seed | `snapper` on a btrfs data disk, mounted with an SELinux `context=` | **Root is btrfs**; SELinux **enforcing** |
 | `omarchy` | [Omarchy Server](https://github.com/edimarlnx/omarchy-server) cloud image | `ufw`, already `limit 22/tcp` | `snapper` ships in the image | Root is btrfs; seeded with **nothing** |
 
 The Omarchy VM installs no packages on purpose. The point of that machine is the image exactly as shipped; adding to it would stop testing the artifact.
@@ -33,6 +33,8 @@ Two things worth knowing before you assume otherwise, both found by building thi
 
 - **Fedora Cloud Base Generic ships no firewall.** `rpm -q firewalld` reports "not installed" on 44-1.7. The seed installs it.
 - **Fedora Cloud Base Generic ships no `script(1)`.** It is split into `util-linux-script`, which the minimised image leaves out. The seed installs it, because the lab renders every TUI frame through a pty.
+- **A btrfs volume made under `/srv` inherits `var_t`, and snapper cannot write to it.** Every `snapper create` fails with `IO Error (mkdir failed errno:13 (Permission denied))` and *no AVC is logged*, because auditd is not running in the Cloud image either. The seed mounts the data disk with `context=system_u:object_r:snapperd_data_t:s0` — the label the root filesystem's own `/.snapshots` carries. A `chcon` on `.snapshots` alone did not survive.
+- **`cloud-init status --wait` must be run with `sudo`.** `/run/cloud-init/cloud.cfg` is root-only on Fedora Cloud, and the unprivileged call dies on a `PermissionError` inside its own polling loop rather than returning, so `up` hangs on a machine that finished minutes ago.
 
 ## Requirements
 
@@ -107,7 +109,7 @@ A tool with no `test/smoke.sh` still gets checks 1 and 2, reported as `SKIP smok
 
 ### `--check`, the non-interactive read path
 
-A TUI has nothing a test can assert on. `tui-firewall` and `tui-systemd` therefore grew a `--check` flag: it runs the backend's **real read path**, prints the parsed model as JSON, and exits 0 or 1. It never builds and never runs a mutation, so it is safe anywhere.
+A TUI has nothing a test can assert on. `tui-firewall`, `tui-systemd` and `tui-snapper` therefore grew a `--check` flag: it runs the backend's **real read path**, prints the parsed model as JSON, and exits 0 or 1. It never builds and never runs a mutation, so it is safe anywhere.
 
 ```console
 $ tui-systemd --check | head -8
@@ -131,6 +133,7 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
 ./lab.sh all up
 ./lab.sh test tui-firewall
 ./lab.sh test tui-systemd
+./lab.sh test tui-snapper
 ./lab.sh all down
 ```
 
@@ -138,6 +141,7 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
 |------|--------|--------|---------|
 | **tui-firewall** | version, demo frame, smoke **5/5** | version, demo frame, smoke **3/3** | version, demo frame, smoke **5/5** |
 | **tui-systemd** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** |
+| **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **15/15** | version, demo frame, smoke **17/17** |
 
 Backend coverage behind those numbers:
 
@@ -148,6 +152,17 @@ Backend coverage behind those numbers:
 | tui-systemd units parsed | 543 | 497 | 478 |
 | active units | 271, matching `systemctl` | 217, matching `systemctl` | 203, matching `systemctl` |
 | journal read | `ModemManager.service` | `NetworkManager-wait-online.service` | `cloud-config.service` |
+| tui-snapper config | `data` on `/srv/data` | `data` on `/srv/data` | `root` on `/` |
+| rollback mechanism | `unsupported` (not the root fs) | `unsupported` (not the root fs) | `boot-menu`, from `/boot/limine.conf` |
+| boot entries parsed | — | — | 5, matching the `///` nodes in `limine.conf` |
+
+### Omarchy and `tui-snapper`
+
+The Omarchy VM is the only machine in the lab that rolls back from the boot menu, so it is the only one where the limine half of `tui-snapper` is exercised at all. The smoke test creates a snapshot with `snapper`, runs `limine-snapper-sync`, and then asserts that the tool's boot-entry count equals the number of snapshot nodes in the generated `/boot/limine.conf` and that the new snapshot's number is among them.
+
+That run found a real bug on the first attempt. `/boot` is the mounted ESP, **mode 0700 and owned by root**, so an unprivileged `tui-snapper` could not open `limine.conf` at all: it reported a machine with a full boot menu as having none, and named the wrong rollback mechanism as a result. Every unit test had passed, because a fixture on disk is readable. The tool now escalates that read the same way it escalates its snapper calls.
+
+The same run also corrected the tool's fixtures. `limine-snapper-sync` on Omarchy Server 4.0.1 titles its entries `4 │ 2026-08-29 21:27:27` — the snapshot number, a U+2502 separator, then the timestamp — where the reconstruction had assumed the timestamp alone. The captured file now lives in `tui-snapper/internal/snapper/testdata/limine-omarchy-server.conf`.
 
 ### Fedora and `tui-firewall`
 

@@ -245,8 +245,9 @@ cmd_images() {
 #            because the Ubuntu cloud image's own root is ext4 and snapper has
 #            nothing to snapshot without one.
 #   fedora   firewalld is already installed and running; snapper + the same
-#            btrfs data disk; policycoreutils so the SELinux state is
-#            inspectable (Fedora Cloud is enforcing out of the box).
+#            btrfs data disk, mounted with an SELinux context because Fedora
+#            Cloud is enforcing out of the box; policycoreutils so the SELinux
+#            state is inspectable.
 #   omarchy  nothing. The image ships the server profile's firewall already,
 #            and installing into it would stop testing the shipped machine.
 write_seed() {
@@ -313,7 +314,15 @@ packages:
 runcmd:
   - [bash, -c, "systemctl enable --now firewalld"]
   - [bash, -c, "firewall-cmd --permanent --add-service=ssh && firewall-cmd --reload"]
-  - [bash, -c, "mkfs.btrfs -qf /dev/vdb && mkdir -p /srv/data && mount /dev/vdb /srv/data && echo '/dev/vdb /srv/data btrfs defaults 0 0' >> /etc/fstab"]
+  # Fedora Cloud is SELinux-enforcing, and a fresh filesystem under /srv
+  # inherits var_t. snapper then fails every `create` with "IO Error (mkdir
+  # failed errno:13 (Permission denied))" — and logs no AVC, because auditd
+  # is not running in the Cloud image either, which is what makes this one
+  # slow to diagnose. `context=` labels the whole mount at mount time with
+  # what the root filesystem's own /.snapshots would carry, which survives a
+  # reboot and does not depend on any xattr the volume may or may not keep.
+  # A `chcon` on .snapshots alone is not enough: it did not survive here.
+  - [bash, -c, "mkfs.btrfs -qf /dev/vdb && mkdir -p /srv/data && mount -o defaults,context=system_u:object_r:snapperd_data_t:s0 /dev/vdb /srv/data && echo '/dev/vdb /srv/data btrfs defaults,context=system_u:object_r:snapperd_data_t:s0 0 0' >> /etc/fstab"]
   - [bash, -c, "snapper -c data create-config /srv/data || true"]
   - [bash, -c, "touch /run/tui-lab-ready"]
 EOF
@@ -419,8 +428,12 @@ cmd_up() {
   # cloud-init's runcmd finishes after sshd is up, so the package prep is still
   # running when the first connection succeeds. Waiting for it here is what
   # makes `up` mean "ready to test".
+  # `sudo -n`, and not a bare call: on Fedora Cloud /run/cloud-init/cloud.cfg
+  # is root-only, so an unprivileged `cloud-init status --wait` dies on a
+  # PermissionError inside its own polling loop and never returns — `up` then
+  # hangs on a machine that finished minutes ago.
   log "waiting for cloud-init to finish"
-  vm_ssh "$name" "cloud-init status --wait >/dev/null 2>&1 || true; cloud-init status --long 2>&1 | head -3" || true
+  vm_ssh "$name" "sudo -n cloud-init status --wait >/dev/null 2>&1 || true; sudo -n cloud-init status --long 2>&1 | head -3" || true
 }
 
 cmd_down() {
