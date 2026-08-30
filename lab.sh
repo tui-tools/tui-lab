@@ -13,6 +13,7 @@
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
+#   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
 #
 # Everything it writes lives under out/ (gitignored): the image cache, the
@@ -488,6 +489,32 @@ cmd_restore() {
 }
 
 # ---------------------------------------------------------------------------
+# build: the binary under test
+# ---------------------------------------------------------------------------
+# build_tool resolves what `test` and `report` are going to ship into the
+# guests and leaves it in $tool_bin: the caller's --bin when it passed one,
+# otherwise a fresh build from the sibling checkout.
+tool_bin=""
+build_tool() {
+  local tool="$1" bin="${2:-}"
+  local repo="$here/../$tool"
+  [[ -d $repo ]] || die "no sibling checkout for $tool at $repo"
+
+  if [[ -z $bin ]]; then
+    need go
+    bin="$out/bin/$tool"
+    mkdir -p "$out/bin"
+    log "building $tool from $repo"
+    # CGO off so one binary runs on every guest regardless of its libc: the
+    # lab's Fedora host would otherwise produce something an Ubuntu guest with
+    # an older glibc refuses to start.
+    ( cd "$repo" && CGO_ENABLED=0 go build -trimpath -o "$bin" "./cmd/$tool" )
+  fi
+  [[ -x $bin ]] || die "not an executable: $bin"
+  tool_bin="$bin"
+}
+
+# ---------------------------------------------------------------------------
 # test: build a tool, ship it in, run its checks
 # ---------------------------------------------------------------------------
 # The contract a tool opts into is one file: test/smoke.sh in its repository.
@@ -509,22 +536,10 @@ cmd_test() {
   done
   ((${#vms[@]})) || vms=(ubuntu fedora omarchy)
 
-  local repo="$here/../$tool"
-  [[ -d $repo ]] || die "no sibling checkout for $tool at $repo"
+  build_tool "$tool" "$bin"
+  bin="$tool_bin"
 
-  if [[ -z $bin ]]; then
-    need go
-    bin="$out/bin/$tool"
-    mkdir -p "$out/bin"
-    log "building $tool from $repo"
-    # CGO off so one binary runs on every guest regardless of its libc: the
-    # lab's Fedora host would otherwise produce something an Ubuntu guest with
-    # an older glibc refuses to start.
-    ( cd "$repo" && CGO_ENABLED=0 go build -trimpath -o "$bin" "./cmd/$tool" )
-  fi
-  [[ -x $bin ]] || die "not an executable: $bin"
-
-  local smoke="$repo/test/smoke.sh"
+  local smoke="$here/../$tool/test/smoke.sh"
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
   local logdir="$out/results/$stamp-$tool"
   mkdir -p "$logdir"
@@ -601,9 +616,172 @@ run_on_vm() {
 }
 
 # ---------------------------------------------------------------------------
+# report: the block a bug report carries, checked on every guest
+# ---------------------------------------------------------------------------
+# Every tool in the family answers `--report` with a plain `key: value` block
+# meant to be pasted verbatim into a public issue. That makes it two things at
+# once: the first thing a maintainer reads, and a privacy promise. The promise
+# is the half a fixture cannot check — it only means anything on a machine that
+# has a real host name, a real user and a real home directory, which is exactly
+# what a guest is and what the developer's own laptop is too dangerous to be.
+#
+# So this runs the block on each guest, live and under --demo, prints both and
+# asserts four things about each: it exits 0, its first line names the tool,
+# nothing in it names this machine, and the demo block says so on the backend
+# line. A failed assertion shows the offending line and fails the command.
+cmd_report() {
+  local target="$1"; shift
+  local bin="" vms=()
+  while (($#)); do
+    case "$1" in
+      --bin) bin="$2"; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) vms+=("$1"); shift ;;
+    esac
+  done
+  ((${#vms[@]})) || vms=(ubuntu fedora omarchy)
+
+  local tools=()
+  if [[ $target == all ]]; then
+    [[ -z $bin ]] || die "--bin names one binary, so it cannot be used with all"
+    mapfile -t tools < <(sibling_tools)
+    ((${#tools[@]})) || die "no sibling tool checkouts next to $here"
+  else
+    tools=("$target")
+  fi
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-report"
+  mkdir -p "$logdir"
+
+  local rc=0 tool name
+  for tool in "${tools[@]}"; do
+    build_tool "$tool" "$bin"
+    for name in "${vms[@]}"; do
+      echo
+      log "=== $tool --report on $name ==="
+      if ! vm_running "$name"; then
+        echo "SKIP  $name is not running (lab.sh up $name)"
+        rc=1
+        continue
+      fi
+      report_on_vm "$tool" "$name" "$tool_bin" "$logdir" || rc=1
+    done
+  done
+
+  echo
+  log "logs: $logdir"
+  return $rc
+}
+
+# sibling_tools lists the tool checkouts next to this one: a tui-* directory
+# with a cmd/<name> package in it. tui-kit is a library and tui-lab is this,
+# so neither has one and neither is listed.
+sibling_tools() {
+  local dir name
+  for dir in "$here"/../tui-*; do
+    name="$(basename "$dir")"
+    [[ -d $dir/cmd/$name ]] && echo "$name"
+  done
+  return 0
+}
+
+# report_on_vm ships the binary in the same way `test` does and checks both
+# blocks the tool can print on this guest.
+report_on_vm() {
+  local tool="$1" name="$2" bin="$3" logdir="$4"
+  local logfile="$logdir/$name-$tool.log" rc=0 host
+
+  vm_scp "$name" "$bin" "/tmp/$tool" >/dev/null
+  vm_ssh "$name" "chmod +x /tmp/$tool"
+
+  # The guest's own idea of its name, asked of the guest rather than taken from
+  # the VM name the lab uses. They agree today, and the leak check should not
+  # be the thing that quietly stops meaning anything if they ever stop.
+  host="$(vm_ssh "$name" "uname -n" | tr -d '\r')"
+
+  check_report "$tool" "$name" "$host" "$logfile" live "/tmp/$tool --report" || rc=1
+  check_report "$tool" "$name" "$host" "$logfile" demo "/tmp/$tool --report --demo" || rc=1
+
+  if ((rc)); then
+    echo "VERDICT  $tool --report on $name: FAIL"
+  else
+    echo "VERDICT  $tool --report on $name: PASS"
+  fi
+  return $rc
+}
+
+# check_report runs one block, prints it, and asserts on it.
+check_report() {
+  local tool="$1" name="$2" host="$3" logfile="$4" mode="$5" cmd="$6"
+  local block status=0 rc=0 headline offenders
+
+  if block="$(vm_ssh "$name" "$cmd" 2>&1)"; then status=0; else status=$?; fi
+
+  echo "--- $tool --report ($mode) on $name"
+  sed 's/^/    /' <<<"$block"
+  {
+    echo "### $tool --report ($mode) on $name — $(date -Is)"
+    printf '%s\n' "$block"
+  } >>"$logfile"
+
+  if ((status == 0)); then
+    echo "PASS  $mode exits 0"
+  else
+    echo "FAIL  $mode exits $status"
+    rc=1
+  fi
+
+  # The headline is the one line of the block that is not a key/value pair,
+  # and it opens with the binary name: a block pasted into the wrong repository
+  # should say so in the line the maintainer reads first.
+  headline="$(head -1 <<<"$block")"
+  if [[ $headline == "$tool "* ]]; then
+    echo "PASS  $mode headline names $tool"
+  else
+    echo "FAIL  $mode headline does not name $tool"
+    echo "      | $headline"
+    rc=1
+  fi
+
+  # The distro and kernel lines are excluded from the host-name search rather
+  # than from the promise: they are built from /etc/os-release and from uname's
+  # release and machine fields, never from its nodename, and every guest here
+  # is named after its distribution, so "fedora" belongs in both of them.
+  #
+  # The user name is matched on word boundaries, not as a substring: the lab
+  # user is called `lab`, and "unavailable" is not a leak.
+  offenders="$(grep -vE '^(distro|kernel): ' <<<"$block" \
+    | grep -E "/home/|/root/|\b($host|$lab_user)\b" || true)"
+  if [[ -z $offenders ]]; then
+    echo "PASS  $mode names neither this machine, its user nor a home path"
+  else
+    echo "FAIL  $mode names this machine, its user or a home path"
+    sed 's/^/      | /' <<<"$offenders"
+    rc=1
+  fi
+
+  # A demo block that does not announce itself is the worst kind of bug report:
+  # every number in it is sample data and nothing says so.
+  if [[ $mode == demo ]]; then
+    if grep -qx 'backend: demo' <<<"$block"; then
+      echo "PASS  demo says backend: demo"
+    else
+      echo "FAIL  demo does not say backend: demo"
+      grep -E '^backend: ' <<<"$block" | sed 's/^/      | /' || true
+      rc=1
+    fi
+  fi
+
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
-usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+# The header block above is the usage text: printed from line 2 until the
+# first line that is not a comment, so adding a command to it is enough.
+usage() { sed -n '2,${/^#/!q;s/^# \?//;p;}' "${BASH_SOURCE[0]}"; }
 
 omarchy_variant=""
 cmd="${1:-}"; shift || true
@@ -618,6 +796,7 @@ case "$cmd" in
   fetch) cmd_fetch "${1:?distro}" ;;
   images) cmd_images ;;
   test) cmd_test "${1:?tool}" "${@:2}" ;;
+  report) cmd_report "${1:?tool|all}" "${@:2}" ;;
   all)
     sub="${1:?up|down|status}"; shift
     case "$sub" in
