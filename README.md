@@ -137,7 +137,7 @@ That is what makes assertions like "the tool's active-unit count equals `systemc
 
 ## Results from a real run
 
-Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row was re-run on `2026-08-30`.
+Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row was re-run on `2026-08-30`, and `tui-logs`, `tui-cron` and `tui-cert` joined on `2026-08-30`.
 
 ```bash
 ./lab.sh all up
@@ -150,6 +150,9 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row 
 ./lab.sh test tui-ssh
 ./lab.sh test tui-disk
 ./lab.sh test tui-update
+./lab.sh test tui-logs
+./lab.sh test tui-cron
+./lab.sh test tui-cert
 ./lab.sh all down
 ```
 
@@ -164,6 +167,9 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row 
 | **tui-ssh** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
 | **tui-disk** | version, demo frame, smoke **13/13** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
 | **tui-update** | version, demo frame, smoke **12/12** | version, demo frame, smoke **11/11** | version, demo frame, smoke **13/13** — see below |
+| **tui-logs** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** |
+| **tui-cron** | version, demo frame, smoke **16/16** | version, demo frame, smoke **15/15** | version, demo frame, smoke **15/15** |
+| **tui-cert** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** |
 
 Backend coverage behind those numbers:
 
@@ -206,6 +212,21 @@ Backend coverage behind those numbers:
 | snapshot before upgrade | none (no snapper root config) | none (no snapper root config) | `snapper` config `root` |
 | unattended-update unit | `apt-daily-upgrade.timer`, enabled | `dnf-automatic.timer`, **not-found** | `omarchy-server-update.timer`, disabled |
 | SMART | none: virtio disks carry none, and no guest has smartmontools | same | same |
+| tui-logs backend version | `systemd 255` | `systemd 259` | `systemd 261` |
+| system journal opened as `lab` | yes, through `wheel`/`adm` | yes | yes |
+| boots parsed | 8, matching `--list-boots` | 7, matching `--list-boots` | 8, matching `--list-boots` |
+| `--list-boots -o json` shape | identical on all three: `index`, `boot_id`, `first_entry`, `last_entry` | same | same |
+| journal storage | persistent (`/var/log/journal`) | persistent | persistent |
+| errors in the last hour | 0, matching `journalctl -p err` | 16, matching | 4, matching |
+| tui-cron backend version | `systemd 255` | `systemd 259` | `systemd 261` |
+| timers parsed | 20, matching `systemctl list-units` | 5, matching | 4, matching |
+| cron | **`cron`**, unit `cron.service`, running | **absent**: Fedora Cloud ships neither `cron` nor `cronie` | **absent** |
+| jobs across the five kinds | 36 | 7 | 4 |
+| tui-cert backend version | openssl 3.0.13 | openssl 3.5.5 | openssl 3.6.4 |
+| ACME client | **none**: no `certbot`, no `acme.sh` | same | same |
+| certificates found | 0 — no guest ships one | 0 | 0 |
+| `/etc/letsencrypt/live` | reported as searched, `skipped: no such file or directory` | same | same |
+| certificate of known contents | generated with `openssl`, read back: subject, 29 days left, key matched, mode 644 raised as a finding | same | same |
 
 ### Omarchy and `tui-snapper`
 
@@ -269,6 +290,25 @@ Two more things only the real image would have shown, both fixed with fixtures c
 Omarchy now passes **13/13**, skipping one: a cloud image built by installing into a chroot has no `/var/log/pacman.log` until its first upgrade. Running a real `omarchy-server-update run --no-reboot` on the guest gives it one, and the suite is 14/14 from there. Ubuntu (apt 2.8.3) and Fedora (dnf 5.4.1) pass 12/12 and 11/11; Fedora skips one, because `needs-restarting` lives in `dnf-plugins-core`, which the Cloud image leaves out.
 
 One gap the lab cannot close: **no guest has SMART**. Every disk is virtio, none of the three images ships `smartmontools`, so `tui-disk`'s health read is asserted only in its absence — each drive must come back `unknown` *with a reason*, which is at least distinguishable from a read the tool forgot to make.
+
+### The three schedulers-and-secrets tools, and what a real box changed
+
+`tui-logs`, `tui-cron` and `tui-cert` joined together. All three passed their backend assertions on the first run — the parsers were right — and all three had a bug somewhere else, which is becoming the pattern: **the read path is the part that gets unit tests, so it is not the part the lab finds things in.**
+
+- **`tui-logs` rendered a demo indistinguishable from a real machine.** It was the only tool in the family whose header subtitle carried the filter instead of `backend.Describe()`, so `--demo` drew a full screen of fabricated entries under a header that said nothing about where they came from. The lab caught it because its `--demo` check greps the rendered frame for the word `demo` and found none — the one lab assertion that needs no cooperation from the tool, failing on all three guests at once. For a log viewer this is the worst possible class of bug: every other tool's demo is obviously a sample, and this one looked like your journal. The subtitle now leads with the backend and appends the filter, which is what the rest of the family does.
+
+- **`tui-logs` also had a compatibility test that could only ever pass while it was vacuous.** `TestTestedVersionsAreBackedByEvidence` looked for `"version":"255"` in `compat/results.jsonl`, and the generator writes `"version": "255"` with a space. It was green for as long as the tested list was empty — which it was, because the tool had never been run against a real machine. The first lab run filled the list in and the test failed on three versions that are in the file. It decodes the JSONL now.
+
+- **`tui-cron`'s smoke test needed `bc`.** Ubuntu ships it; Fedora Cloud Base and Omarchy Server do not. `paste -sd+ | bc` printed `command not found`, the sum came back empty, and the "jobs are accounted for across the five kinds" assertion failed on two of three machines for a reason with nothing to do with the tool. It adds the counts in `awk` now.
+
+- **`tui-cert`'s absent-client path was the one that always ran, and the only one nobody asserted.** No image in the lab ships `certbot` or `acme.sh`, so the smoke test's certbot block was dead code on every guest while the branch that really executed went unchecked. The tool's behaviour turned out to be right — `{"name":"certbot","present":false,"purpose":…}`, an empty `acme` list, no invented `timerActive`, and `/etc/letsencrypt/live` still reported as searched with `skipped: no such file or directory` — but "right and unasserted" is how it stays right by luck. The absent branch is now four assertions, and tui-cert went from 18 checks to 22.
+
+Two facts the run established that were previously assumed:
+
+- **`journalctl --list-boots -o json` is the same shape on systemd 255, 259 and 261** — `index`, `boot_id`, `first_entry`, `last_entry`, no additions. That is the one read in `tui-logs` gated on a version, and the gate is at 252, so the whole tested range is above it and the table fallback never ran here. Both ends are now fixtures captured from the guests (`list-boots-json-systemd{255,261}.txt`), so a future release that changes the shape fails a unit test rather than a screen.
+- **Fedora Cloud Base ships neither `cron` nor `cronie`**, so two of the three guests exercise `tui-cron`'s cron-absent branch and only Ubuntu exercises the present one. Ubuntu's unit is `cron.service`; nothing in the lab is a `crond.service` machine, so that half of the unit-name detection is still covered only by fixtures.
+
+Nothing in these three suites writes: no crontab is installed, no timer enabled, no certificate issued, no journal vacuumed. `tui-cert` generates a throwaway key pair with `openssl` in a `mktemp -d` it removes on exit, which is the only file any of them creates.
 
 ## License
 
