@@ -47,7 +47,9 @@ sudo apt install qemu-system-x86 ovmf cloud-image-utils xorriso socat golang
 
 ### Resource footprint
 
-Each VM defaults to **2 GB RAM, 2 vCPUs, a 20 GB thin disk and a 4 GB data disk**. All three together idle at about **6 GB of RAM**; the qcow2 files grow to roughly **2–3 GB each** once cloud-init has run. The image cache adds about **2.3 GB** (Ubuntu 0.6 GB, Fedora 0.6 GB, Omarchy 1.2 GB).
+Each VM defaults to **2 GB RAM, 2 vCPUs, a 20 GB thin disk and a 4 GB data disk**. All three together need about **6 GB of RAM** while running. On disk after a full run: **4.5 GB of VM state** (ubuntu 2.3 GB, omarchy 1.4 GB, fedora 0.9 GB — thin qcow2, so far below the 20 GB they advertise) plus a **2.3 GB image cache** (Ubuntu 0.6 GB, Fedora 0.6 GB, Omarchy 1.2 GB). Call it **7 GB and 6 GB of RAM** for the full lab.
+
+The Omarchy image declares a virtual size larger than the 20 GB default, so `--disk` only ever grows a disk and leaves that one at its own size.
 
 A first `lab.sh all up` on a cold cache takes a few minutes, most of it downloading. Afterwards a VM boots and finishes cloud-init in well under two minutes.
 
@@ -144,7 +146,7 @@ Backend coverage behind those numbers:
 | tui-firewall backend | `ufw` (real) | `firewalld` (**stub**) | `ufw` (real) |
 | rules parsed | 2, matching `ufw status numbered` | — | 2, matching `ufw status numbered` |
 | tui-systemd units parsed | 543 | 497 | 478 |
-| active units | 272, matching `systemctl` | 217, matching `systemctl` | 202, matching `systemctl` |
+| active units | 271, matching `systemctl` | 217, matching `systemctl` | 203, matching `systemctl` |
 | journal read | `ModemManager.service` | `NetworkManager-wait-online.service` | `cloud-config.service` |
 
 ### Fedora and `tui-firewall`
