@@ -1,0 +1,10 @@
+# Everything the lab produces: the image cache, the VM disks, the lab ssh key
+# and the test logs. Nothing under out/ is ever committed — it holds a private
+# key and multi-gigabyte disk images.
+/out/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
