@@ -1961,7 +1961,11 @@ cmd_router_test_via_tool() {
   tui_keys v; tui_pick "inet tui / input" || true
   tui_keys a
   tui_wait_for "Add rule" 20 || true
+  # Phase 2 gives the form an interface field, so "block wan-host" is scoped
+  # to the interface it arrives on — iifname "wan0" ip saddr … drop — the
+  # shape a real firewall rule has, not "everything from that address".
   tui_focus "Action" && tui_keys Enter && tui_pick "DENY"
+  tui_focus "In iface" && tui_type "wan0"
   tui_focus "From" && tui_type "$wan_host_ip"
   tui_focus "Comment" && tui_type "lab: input proof"
   tui_shot "input-rule-form"
@@ -1969,8 +1973,8 @@ cmd_router_test_via_tool() {
   tui_confirm "input-rule-add"
 
   body="$(rtt_nft)" || true
-  ok=1; grep -q "ip saddr $wan_host_ip .*drop" <<<"$body" && ok=0
-  rt_verdict "the rule the form wrote is in the ruleset, as a drop on wan-host's address" "$ok"
+  ok=1; grep -qE "iifname \"wan0\" ip saddr $wan_host_ip .*drop" <<<"$body" && ok=0
+  rt_verdict "the rule the form wrote is scoped to wan0, a drop on wan-host's address" "$ok"
 
   ok=1; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=0
   rt_verdict "a rule added in the TUI blocks wan-host from reaching the router" "$ok"
@@ -1988,12 +1992,18 @@ cmd_router_test_via_tool() {
   tui_keys a
   tui_wait_for "Add rule" 20 || true
   tui_focus "Action" && tui_keys Enter && tui_pick "REJECT"
+  tui_focus "Out iface" && tui_type "wan0"
   tui_focus "Port(s)" && tui_type "$wan_host_port"
   tui_focus "Protocol" && tui_keys Enter && tui_pick "tcp"
   tui_focus "To" && tui_type "$wan_host_ip"
   tui_focus "Comment" && tui_type "lab: output proof"
+  tui_shot "output-rule-form"
   tui_keys Enter
   tui_confirm "output-rule-add"
+
+  body="$(rtt_nft)" || true
+  ok=1; grep -qE "oifname \"wan0\" ip daddr $wan_host_ip .*reject" <<<"$body" && ok=0
+  rt_verdict "the output rule the form wrote is scoped to wan0, to wan-host's address" "$ok"
 
   ok=1; rt_curl router "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
   rt_verdict "an output rule added in the TUI blocks the router's own traffic to wan-host" "$ok"
@@ -2003,18 +2013,59 @@ cmd_router_test_via_tool() {
   ok=0; rt_curl router "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
   rt_verdict "deleting it lets the router out again" "$ok"
 
+  # -- 3b. an ICMP rule: drop wan-host's pings, added and deleted in the TUI-
+  # Phase 1 could not write "stop this host pinging me": the protocol field
+  # was tcp or udp only, so the rule had to be "stop this host". Phase 2 adds
+  # icmp and an ICMP-type field, so the rule is exactly the ping, scoped to
+  # the interface it arrives on, and nothing else the host sends is touched.
+  ok=0; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=1
+  rt_verdict "before the ICMP rule, wan-host can ping the router" "$ok"
+
+  tui_keys v; tui_pick "inet tui / input" || true
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "DENY"
+  tui_focus "Protocol" && tui_keys Enter && tui_pick "icmp"
+  tui_focus "ICMP type" && tui_type "echo-request"
+  tui_focus "In iface" && tui_type "wan0"
+  tui_focus "From" && tui_type "$wan_host_ip"
+  tui_focus "Comment" && tui_type "lab: icmp proof"
+  tui_shot "icmp-rule-form"
+  tui_keys Enter
+  tui_confirm "icmp-rule-add"
+
+  body="$(rtt_nft)" || true
+  ok=1; grep -qE "iifname \"wan0\" ip saddr $wan_host_ip .*icmp type echo-request .*drop" <<<"$body" && ok=0
+  rt_verdict "the ICMP rule the form wrote drops echo-request from wan-host on wan0" "$ok"
+
+  ok=1; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=0
+  rt_verdict "the ICMP rule blocks wan-host's ping to the router" "$ok"
+
+  tui_keys d
+  tui_confirm "icmp-rule-delete"
+  ok=0; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=1
+  rt_verdict "deleting the ICMP rule lets wan-host ping the router again" "$ok"
+
   # -- 4. masquerade from the actions menu (mirrors 5, 6 and 7) -------------
   ok=1; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
   rt_verdict "before the masquerade, lan-client cannot reach wan-host" "$ok"
 
   rt_run wan-host "sudo -n truncate -s 0 /var/log/wan-http.log" >/dev/null
+  # Phase 2's masquerade action takes an optional source network, so the rule
+  # is scoped to the LAN behind the router — ip saddr <lan> oifname "wan0"
+  # masquerade — not "everything leaving the interface".
   tui_keys x
-  tui_pick "Masquerade everything leaving an interface" || true
+  tui_pick "Masquerade an interface (optionally one source network)" || true
   tui_wait_for "Outgoing interface" 20 && tui_type "wan0" && tui_keys Enter
+  tui_wait_for "Source network" 20 && tui_type "$router_lan_net" && tui_keys Enter
   tui_confirm "masquerade"
 
+  body="$(rtt_nft)" || true
+  ok=1; grep -qE "ip saddr $router_lan_net oifname \"wan0\" .*masquerade" <<<"$body" && ok=0
+  rt_verdict "the masquerade the TUI wrote is scoped to the lan source leaving wan0" "$ok"
+
   ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
-  rt_verdict "with the masquerade the TUI wrote, lan-client reaches wan-host" "$ok"
+  rt_verdict "with the source-scoped masquerade the TUI wrote, lan-client reaches wan-host" "$ok"
 
   body="$(rt_run wan-host "sudo -n cat /var/log/wan-http.log")" || true
   ok=1
@@ -2031,29 +2082,42 @@ cmd_router_test_via_tool() {
   ok=1; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
   rt_verdict "the forward policy the TUI set to deny stops LAN to WAN traffic" "$ok"
 
-  # Two rules where the hand-written run needs one: the form has no
-  # conntrack state field, so the way back is a rule of its own.
+  # The stateful pair a real router forwards with, which phase 2's conntrack
+  # and interface fields finally let the form write: one rule accepts the
+  # return traffic of any tracked connection (ct state established,related),
+  # and one accepts new connections leaving lan0 for wan0. Not the two
+  # stateless address rules phase 1 had to settle for.
   tui_keys a
   tui_wait_for "Add rule" 20 || true
-  tui_focus "From" && tui_type "$router_lan_net"
-  tui_focus "Comment" && tui_type "lab: lan out"
+  tui_focus "Action" && tui_keys Enter && tui_pick "ALLOW"
+  tui_focus "Conn. state" && tui_keys Enter && tui_pick "established,related"
+  tui_focus "Comment" && tui_type "lab: established back"
+  tui_shot "forward-rule-stateful-form"
   tui_keys Enter
-  tui_confirm "forward-rule-out"
+  tui_confirm "forward-rule-established"
 
   tui_keys a
   tui_wait_for "Add rule" 20 || true
-  tui_focus "To" && tui_type "$router_lan_net"
-  tui_focus "Comment" && tui_type "lab: lan back"
+  tui_focus "Action" && tui_keys Enter && tui_pick "ALLOW"
+  tui_focus "In iface" && tui_type "lan0"
+  tui_focus "Out iface" && tui_type "wan0"
+  tui_focus "Comment" && tui_type "lab: lan new out"
   tui_keys Enter
-  tui_confirm "forward-rule-back"
+  tui_confirm "forward-rule-new"
+
+  body="$(rtt_nft)" || true
+  ok=1
+  grep -q "ct state established,related" <<<"$body" \
+    && grep -qE "iifname \"lan0\" oifname \"wan0\" .*accept" <<<"$body" && ok=0
+  rt_verdict "the forward rules the TUI wrote are the stateful pair, not two stateless rules" "$ok"
 
   ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
-  rt_verdict "the forward rules the TUI wrote let LAN to WAN through" "$ok"
+  rt_verdict "the stateful forward rules the TUI wrote let LAN to WAN through" "$ok"
 
   body="$(rt_run router "sudo -n nft list chain inet tui forward")" || true
   ok=1
-  [[ $(grep "ip saddr $router_lan_net" <<<"$body" | sed -n 's/.*counter packets \([0-9]*\).*/\1/p') -gt 0 ]] && ok=0
-  rt_verdict "the forward rule's packet counter moved" "$ok"
+  [[ $(grep 'iifname "lan0" oifname "wan0"' <<<"$body" | sed -n 's/.*counter packets \([0-9]*\).*/\1/p') -gt 0 ]] && ok=0
+  rt_verdict "the new-connection forward rule's packet counter moved" "$ok"
 
   tui_keys p
   tui_pick "routed" || true
@@ -2138,6 +2202,128 @@ cmd_router_test_via_tool() {
   body="$(rtt_nft)" || true
   ok=1; grep -q "@hostile" <<<"$body" && ok=0
   rt_verdict "the rule that used the alias is still there" "$ok"
+
+  # -- 8. item 16, scenario 1: a staged, atomic, connectivity-safe apply ---
+  # Rule by rule, a forward policy of drop set before the accept rules that
+  # keep the LAN alive cuts the LAN off in the gap between them. Phase 2 stages
+  # the whole set instead: changes are collected, reviewed as one, and applied
+  # as a single nft transaction — all of them or none. Start from an empty
+  # forward chain with policy accept, so the batch is the only thing that acts.
+  tui_keys v; tui_pick "inet tui / forward" || true
+  tui_keys d; tui_confirm "forward-clear-1"
+  tui_keys d; tui_confirm "forward-clear-2"
+
+  ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "with the forward chain cleared and policy accept, the LAN still flows" "$ok"
+
+  tui_keys s
+  tui_wait_for "staging" 10
+  tui_shot "staging-on"
+
+  # A forward policy of drop — staged, not applied.
+  tui_keys p
+  tui_pick "routed" || true
+  tui_pick "deny" || true
+
+  # The accept rules that keep the LAN (and any tracked session) alive — staged.
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "ALLOW"
+  tui_focus "Conn. state" && tui_keys Enter && tui_pick "established,related"
+  tui_focus "Comment" && tui_type "lab: staged back"
+  tui_keys Enter
+
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "ALLOW"
+  tui_focus "In iface" && tui_type "lan0"
+  tui_focus "Out iface" && tui_type "wan0"
+  tui_focus "Comment" && tui_type "lab: staged new out"
+  tui_keys Enter
+
+  # Nothing is applied yet: the ruleset still has policy accept and no staged rule.
+  body="$(rt_run router "sudo -n nft list chain inet tui forward")" || true
+  ok=0
+  grep -q "lab: staged" <<<"$body" && ok=1
+  grep -q "policy drop" <<<"$body" && ok=1
+  rt_verdict "the staged batch is pending, not yet in the ruleset" "$ok"
+
+  # Review the staged set, then apply it atomically. The confirm shows the
+  # whole nft transaction — every line that goes to nft's stdin — before the
+  # single y that commits it, which is the batch's own preview-and-confirm.
+  tui_keys S
+  tui_wait_for "Apply" 15
+  tui_shot "staging-review"
+  tui_keys Enter
+  tui_confirm "staged-apply"
+
+  # After the atomic apply the batch awaits a keep; k confirms access is intact.
+  tui_wait_for "keep" 15
+  tui_shot "staging-awaiting-keep"
+  tui_keys k
+  tui_wait_gone "awaiting keep" 15
+  tui_shot "staging-kept"
+
+  # No half-applied state: the drop policy AND both accept rules are all there.
+  body="$(rt_run router "sudo -n nft list chain inet tui forward")" || true
+  ok=1
+  grep -q "policy drop" <<<"$body" \
+    && grep -q "ct state established,related" <<<"$body" \
+    && grep -qE "iifname \"lan0\" oifname \"wan0\" .*accept" <<<"$body" && ok=0
+  rt_verdict "the batch applied atomically: forward policy drop and both accept rules all landed" "$ok"
+
+  ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "traffic still flows after the atomic apply: the keep rules kept the LAN alive" "$ok"
+
+  # -- 9. item 16, scenario 2: apply, never keep, auto-rollback ------------
+  # The lockout case: the operator applies a batch and then loses access before
+  # confirming. With no keep inside the window, the snapshot taken before the
+  # apply is restored on its own — the connectivity-safe half of an OPNsense
+  # apply. A visible probe rule is staged so the rollback has something to undo.
+  tui_keys v; tui_pick "inet tui / input" || true
+  tui_keys s
+  tui_wait_for "staging" 10
+
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "DENY"
+  tui_focus "In iface" && tui_type "wan0"
+  tui_focus "From" && tui_type "$wan_host_ip"
+  tui_focus "Comment" && tui_type "lab: rollback probe"
+  tui_keys Enter
+
+  tui_keys S
+  tui_wait_for "Apply" 15
+  tui_shot "rollback-review"
+  tui_keys Enter
+  tui_confirm "rollback-apply"
+
+  # The change is live while the keep window is open.
+  body="$(rtt_nft)" || true
+  ok=1; grep -q "lab: rollback probe" <<<"$body" && ok=0
+  rt_verdict "the applied batch is live while it waits for a keep" "$ok"
+  tui_shot "rollback-awaiting-keep"
+
+  # Do NOT press k. Wait the keep window out and let it revert by itself. The
+  # default keep timeout is 60s; poll the ruleset — never wrapping ssh in
+  # timeout — until the probe is gone.
+  ok=1
+  for _ in $(seq 1 40); do
+    body="$(rt_run router "sudo -n nft list ruleset")" || true
+    grep -q "lab: rollback probe" <<<"$body" || { ok=0; break; }
+    sleep 3
+  done
+  rt_verdict "with no keep in the window, the ruleset auto-rolled back to the snapshot" "$ok"
+  tui_shot "rollback-restored"
+
+  # The snapshot restored is exactly the pre-apply ruleset: the kept batch from
+  # scenario 1 (forward policy drop and the accept rules) is still in place,
+  # so the rollback was a whole-ruleset restore, not a flush to empty.
+  body="$(rt_run router "sudo -n nft list chain inet tui forward")" || true
+  ok=1
+  grep -q "policy drop" <<<"$body" \
+    && grep -qE "iifname \"lan0\" oifname \"wan0\" .*accept" <<<"$body" && ok=0
+  rt_verdict "the restored snapshot is the pre-apply ruleset, not an empty or half state" "$ok"
 
   # -- done: leave the machine as `up` handed it over ----------------------
   tui_stop

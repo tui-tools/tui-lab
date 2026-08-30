@@ -173,61 +173,80 @@ same preview and confirm as everything after it.
 |---|-----------------------|---------|
 | 1 | The actions menu created `inet tui` with its five chains | — |
 | 2 | Before the rule, `wan-host` reaches the router | 12 |
-| 3 | The rule the form wrote is in the ruleset, as a drop on `wan-host`'s address | 12 |
+| 3 | The rule the form wrote is scoped to `wan0`, a drop on `wan-host`'s address | 12 |
 | 4 | A rule added in the TUI blocks `wan-host` from reaching the router | 12 |
 | 5 | Deleting it in the TUI restores the reach | 13 |
 | 6 | Before the rule, the router reaches the service on `wan-host` | 14 |
-| 7 | An output rule added in the TUI blocks the router's own traffic | 14 |
+| 7 | An output rule scoped to `wan0` blocks the router's own traffic | 14 |
 | 8 | Deleting it lets the router out again | — |
-| 9 | Before the masquerade, `lan-client` cannot reach `wan-host` | 5 |
-| 10 | With the masquerade the TUI wrote, it can | 6 |
-| 11 | `wan-host` logged the router's wan address, not the client's | 7 |
-| 12 | The forward policy the TUI set to deny stops LAN to WAN traffic | 9 |
-| 13 | The forward rules the TUI wrote let it through | 10 |
-| 14 | That rule's packet counter moved | 11 |
-| 15 | Before the port forward, the router's wan address serves nothing | 17 |
-| 16 | The port forward the TUI wrote exposes `lan-client` on it | 18 |
-| 17 | Deleting it in the TUI closes it again | 19 |
-| 18 | The rule the TUI wrote matches the alias by name | 15 |
-| 19 | A rule matching the alias blocks the address in it | 15 |
-| 20 | Emptying the alias in the TUI propagates, without touching the rule | 16 |
-| 21 | The rule that used the alias is still there | 16 |
+| 9 | Before the ICMP rule, `wan-host` can ping the router | — |
+| 10 | An ICMP rule drops `wan-host`'s echo-request on `wan0`; the ping fails | — |
+| 11 | Deleting the ICMP rule lets the ping through again | — |
+| 12 | Before the masquerade, `lan-client` cannot reach `wan-host` | 5 |
+| 13 | The masquerade the TUI wrote is scoped to the LAN source leaving `wan0` | — |
+| 14 | With that source-scoped masquerade, `lan-client` reaches `wan-host` | 6 |
+| 15 | `wan-host` logged the router's wan address, not the client's | 7 |
+| 16 | The forward policy the TUI set to deny stops LAN to WAN traffic | 9 |
+| 17 | The forward rules the TUI wrote are the stateful pair, not two stateless rules | — |
+| 18 | The stateful forward rules let LAN to WAN through | 10 |
+| 19 | The new-connection forward rule's packet counter moved | 11 |
+| 20 | Before the port forward, the router's wan address serves nothing | 17 |
+| 21 | The port forward the TUI wrote exposes `lan-client` on it | 18 |
+| 22 | Deleting it in the TUI closes it again | 19 |
+| 23 | The rule the TUI wrote matches the alias by name | 15 |
+| 24 | A rule matching the alias blocks the address in it | 15 |
+| 25 | Emptying the alias in the TUI propagates, without touching the rule | 16 |
+| 26 | The rule that used the alias is still there | 16 |
 
 Evidence lands under `out/results/<stamp>-router-via-tool/`: the run log with
 every key sequence, every pane and every probe, and `panes/` with the screens
 themselves, numbered in the order they were taken.
 
-### What the UI could not express
+### The staged, atomic, connectivity-safe apply
 
-Two mirrored checks are not written the way the hand-written suite writes
-them, and both differences are the tool's, not the lab's:
+Two more proofs sit at the end of the suite, and they are the ones a router
+needs most: applying a set of rules that would cut the operator off if it were
+applied a rule at a time. Phase 2 stages the whole set instead, and the lab
+drives both halves of it.
 
-- **Check 12** blocks `wan-host` with `iifname "wan0" … icmp type
-  echo-request drop`. The add-rule form has no interface field and its
-  protocol choice is `tcp` or `udp`, so the rule the TUI can write is `ip
-  saddr 10.90.0.20 counter drop` — everything from that host, rather than its
-  pings arriving on that interface. The probe is the same and so is the
-  verdict; the rule is blunter.
-- **Check 10** lets the LAN out with one stateful pair, `ct state
-  established,related accept` plus `iifname "lan0" oifname "wan0" accept`.
-  The form has no connection-state field, so the way out and the way back are
-  two stateless rules: `ip saddr 10.91.0.0/24 accept` and `ip daddr
-  10.91.0.0/24 accept`.
+The first is the atomic apply. With staging on (`s`), the forward chain is
+cleared to policy accept, then a batch is collected: a forward policy of
+**drop** together with the two accept rules that keep the LAN alive. Applied
+rule by rule, the drop would strand the LAN in the gap before the accepts;
+staged, the review pane (`S`) shows the whole set and the confirm shows the
+exact `nft -f` transaction — every line that goes to nft's standard input —
+before the single `y`. The proof is that the ruleset lands whole (the drop
+policy **and** both accept rules, never a half of it) and traffic still flows.
+Both the review pane and the apply preview are filed under `panes/` before the
+confirm.
 
-What the phase-1 UI does not expose at all, and what a rule editor for a
-router eventually needs:
+The second is the timeout rollback. A batch is applied and then **not** kept:
+the operator is simulated as cut off, `k` is never pressed, and the keep window
+runs out. The proof is that the ruleset reverts on its own to the snapshot the
+tool captured before the apply — the applied change is gone, and the ruleset
+that comes back is the one that was there before — with no key press from the
+driver. This is the connectivity-safe half of an OPNsense apply, run for real.
 
-| Missing | Consequence here |
-|---------|------------------|
-| An interface match on a filter rule (`iifname`, `oifname`) | Rules are scoped by address only; masquerade and port forward do take an interface |
-| A connection-state match (`ct state`) | No stateful rule from the UI; return traffic needs a rule of its own |
-| Protocols beyond `tcp` and `udp` | No ICMP rule, so "stop this host pinging me" has to be "stop this host" |
-| Deleting the tool's own table or chains | The actions menu creates them and nothing removes them; the run flushes the ruleset over ssh at the end |
-| A source-scoped masquerade | The action masquerades everything leaving an interface, not one network behind it |
+### What the UI expresses now
 
-Everything else the acceptance needs is there: rules in the input, forward and
-output views, chain policies, masquerade, port forwards, aliases and their
-members, and delete for each of them.
+Phase 1 could not write an interface match, a connection state, an ICMP type or
+a source-scoped masquerade, so several checks were blunter than the hand-written
+suite: "stop this host" where the rule wanted "stop this host's pings on this
+interface", and two stateless rules where one stateful pair belonged. Phase 2
+closes those gaps, and the checks above are now written the way a router
+operator writes them:
+
+| Was missing in phase 1 | Written by the TUI now |
+|------------------------|------------------------|
+| An interface match on a filter rule (`iifname`, `oifname`) | The input and output rules are scoped to `wan0`; the new-connection forward rule is `iifname "lan0" oifname "wan0"` |
+| A connection-state match (`ct state`) | The forward chain's return path is one stateful rule, `ct state established,related accept` |
+| Protocols beyond `tcp` and `udp` | An ICMP rule drops exactly `echo-request`, so "stop this host pinging me" is the ping, not the host |
+| A source-scoped masquerade | The masquerade is `ip saddr 10.91.0.0/24 oifname "wan0" masquerade`, one network behind the router rather than everything leaving the link |
+| A staged, atomic apply with a connectivity-safe rollback | The two proofs above |
+
+The actions menu can also take the table and its chains apart now, previewed
+like any other mutation, though the run still flushes the ruleset over ssh at
+the end so the machine is left exactly as `up` handed it over.
 
 ## The libvirt backend
 
