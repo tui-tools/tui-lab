@@ -138,30 +138,27 @@ That is what makes assertions like "the tool's active-unit count equals `systemc
 
 ## Results from a real run
 
-Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row was re-run on `2026-08-30`, and `tui-logs`, `tui-cron` and `tui-cert` joined on `2026-08-30`. The Fedora VM was then **rebuilt from the seed with `cronie`** and `tui-cron` re-run against all three on `2026-08-30`, so its row and the cron facts below come from the rebuilt machine; the other Fedora figures were measured before it and have not been re-taken.
+Fedora host, KVM, three VMs at the defaults. **Every Fedora figure below was taken on `2026-08-30`**, in one sweep of all fourteen tools against the VM rebuilt from the seed with `cronie` — the caveat that used to sit here, about Fedora numbers measured before that rebuild and never re-taken, is gone. `tui-firewall`, `tui-samba` and `tui-containers` were run on all three guests the same day; the ubuntu and omarchy columns for the other eleven are from `2026-08-29` and are unchanged.
+
+Two packages were installed on the Fedora guest by hand for this sweep, `samba` and nothing else — `podman` was already there — so that `tui-samba`'s present branch would run against a real `smbd` once rather than never. That is why Fedora's group count moved from 47 to 48. The VM is disposable and was left as it is.
 
 ```bash
 ./lab.sh all up
 ./lab.sh test tui-firewall
-./lab.sh test tui-systemd
-./lab.sh test tui-snapper
-./lab.sh test tui-network
-./lab.sh test tui-secure
-./lab.sh test tui-users
-./lab.sh test tui-ssh
-./lab.sh test tui-disk
-./lab.sh test tui-update
-./lab.sh test tui-logs
-./lab.sh test tui-cron
-./lab.sh test tui-cert
+./lab.sh test tui-samba
+./lab.sh test tui-containers
+for tool in tui-systemd tui-snapper tui-network tui-secure tui-users \
+            tui-ssh tui-disk tui-update tui-logs tui-cron tui-cert; do
+  ./lab.sh test "$tool" fedora
+done
 ./lab.sh all down
 ```
 
 | Tool | ubuntu | fedora | omarchy |
 |------|--------|--------|---------|
-| **tui-firewall** | version, demo frame, smoke **5/5** | version, demo frame, smoke **3/3** | version, demo frame, smoke **5/5** |
+| **tui-firewall** | version, demo frame, smoke **5/5** | version, demo frame, smoke **14/14** — see below | version, demo frame, smoke **5/5** |
 | **tui-systemd** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** |
-| **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **15/15** | version, demo frame, smoke **17/17** |
+| **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **16/16** | version, demo frame, smoke **17/17** |
 | **tui-network** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** |
 | **tui-secure** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **22/22** |
 | **tui-users** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** |
@@ -171,17 +168,20 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row 
 | **tui-logs** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** |
 | **tui-cron** | version, demo frame, smoke **18/18** | version, demo frame, smoke **18/18** | version, demo frame, smoke **19/19** — see below |
 | **tui-cert** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** |
+| **tui-samba** | version, demo frame, smoke **18/18** | version, demo frame, smoke **21/21** — see below | version, demo frame, smoke **18/18** |
+| **tui-containers** | version, demo frame, smoke **15/15** | version, demo frame, smoke **13/13** | version, demo frame, smoke **15/15** — see below |
 
 Backend coverage behind those numbers:
 
 | | ubuntu | fedora | omarchy |
 |---|---|---|---|
-| tui-firewall backend | `ufw` (real) | `firewalld` (**stub**) | `ufw` (real) |
-| rules parsed | 2, matching `ufw status numbered` | — | 2, matching `ufw status numbered` |
-| tui-firewall backend version | `ufw 0.36.2` | — | `ufw 0.36.2` |
+| tui-firewall backend | `ufw` (real) | `firewalld` (**real**) | `ufw` (real) |
+| rules parsed | 2, matching `ufw status numbered` | `public` zone: `ssh` service, `target: default` | 2, matching `ufw status numbered` |
+| tui-firewall backend version | `ufw 0.36.2` | `firewalld 2.4.4` | `ufw 0.36.2` |
+| tui-firewall mutation exercised | — | `65530/tcp` added and removed through the tool, runtime only | — |
 | tui-systemd backend version | `systemd 255` | `systemd 259` | `systemd 261` |
-| tui-systemd units parsed | 543 | 497 | 478 |
-| active units | 271, matching `systemctl` | 217, matching `systemctl` | 203, matching `systemctl` |
+| tui-systemd units parsed | 543 | 505 | 478 |
+| active units | 271, matching `systemctl` | 215, matching `systemctl` | 203, matching `systemctl` |
 | journal read | `ModemManager.service` | `NetworkManager-wait-online.service` | `cloud-config.service` |
 | tui-snapper config | `data` on `/srv/data` | `data` on `/srv/data` | `root` on `/` |
 | rollback mechanism | `unsupported` (not the root fs) | `unsupported` (not the root fs) | `boot-menu`, from `/boot/limine.conf` |
@@ -195,7 +195,7 @@ Backend coverage behind those numbers:
 | tui-secure MAC layer | AppArmor | SELinux | none (probe answers `unknown`) |
 | tui-secure firewall / updates | `ufw` / `debian` | `firewalld` / `fedora` | `ufw` / `arch` |
 | tui-secure backend versions | ufw 0.36.2, OpenSSH 9.6, systemd 255 | firewalld 2.4.4, OpenSSH 10.2, systemd 259 | ufw 0.36.2, OpenSSH 10.5, systemd 261 |
-| tui-users accounts / groups | 33 / 62, matching `getent` | 26 / 47, matching `getent` | 20 / 53, matching `getent` |
+| tui-users accounts / groups | 33 / 62, matching `getent` | 26 / 48, matching `getent` | 20 / 53, matching `getent` |
 | `ALL` lines in `/etc/sudoers` | 3 | 3 | 1 |
 | tui-users key read | fingerprint matches `ssh-keygen -lf`, through `sudo -n` | same | same |
 | tui-ssh unit | `ssh` | `sshd` | `sshd` |
@@ -208,29 +208,36 @@ Backend coverage behind those numbers:
 | tui-update manager | `apt` | `dnf` | `pacman` |
 | tui-update backend version | apt 2.8.3 | dnf 5.4.1 | pacman 7.1.0 |
 | pending list read with | `apt list --upgradable` | `dnf check-update` | **`pacman -Qu`** (no `fakeroot`) |
-| pending count | 12, matching apt | 184, matching dnf | 0, matching pacman |
+| pending count | 12, matching apt | 181, matching dnf | 0, matching pacman |
 | restart classifier | `needrestart` | `needs-restarting` (**absent**) | `omarchy-server-update-restart` |
 | snapshot before upgrade | none (no snapper root config) | none (no snapper root config) | `snapper` config `root` |
 | unattended-update unit | `apt-daily-upgrade.timer`, enabled | `dnf-automatic.timer`, **not-found** | `omarchy-server-update.timer`, disabled |
 | SMART | none: virtio disks carry none, and no guest has smartmontools | same | same |
 | tui-logs backend version | `systemd 255` | `systemd 259` | `systemd 261` |
 | system journal opened as `lab` | yes, through `wheel`/`adm` | yes | yes |
-| boots parsed | 8, matching `--list-boots` | 7, matching `--list-boots` | 8, matching `--list-boots` |
+| boots parsed | 8, matching `--list-boots` | 2, matching `--list-boots` | 8, matching `--list-boots` |
 | `--list-boots -o json` shape | identical on all three: `index`, `boot_id`, `first_entry`, `last_entry` | same | same |
 | journal storage | persistent (`/var/log/journal`) | persistent | persistent |
-| errors in the last hour | 0, matching `journalctl -p err` | 16, matching | 4, matching |
+| errors in the last hour | 0, matching `journalctl -p err` | 21, matching | 4, matching |
 | tui-cron backend version | `systemd 255` | `systemd 259` | `systemd 261` |
-| timers parsed | 20, matching `systemctl list-units` | 4, matching | 4, matching |
+| timers parsed | 20, matching `systemctl list-units` | 6, matching | 4, matching |
 | cron | **`cron`**, unit `cron.service`, running | **`cronie` 1.7.2**, unit `crond.service`, running | **absent**: no `crontab`, no `/etc/crontab` |
 | `/etc/crontab` + `/etc/cron.d` job lines | 8, matching the tables | 1, `/etc/cron.d/0hourly` | 0 |
 | this account's `crontab -l` | empty, and read as empty rather than as a failed read | same, from cronie's exit 1 | — |
 | run-parts scripts | 7, matching the `cron.*` directories | 1, `cron.hourly/0anacron` | 1, `cron.hourly/snapper`, **listed as unrunnable** |
-| jobs across the five kinds | 36 | 8 | 5 |
+| jobs across the five kinds | 36 | 10 | 5 |
 | tui-cert backend version | openssl 3.0.13 | openssl 3.5.5 | openssl 3.6.4 |
 | ACME client | **none**: no `certbot`, no `acme.sh` | same | same |
 | certificates found | 0 — no guest ships one | 0 | 0 |
 | `/etc/letsencrypt/live` | reported as searched, `skipped: no such file or directory` | same | same |
 | certificate of known contents | generated with `openssl`, read back: subject, 29 days left, key matched, mode 644 raised as a finding | same | same |
+| tui-samba server | **absent**: no `smbd` | **Samba 4.24.6**, installed by hand for this sweep | **absent**: no `smbd` |
+| shares parsed | — | 3 from the shipped `smb.conf`; `[homes]` and `[printers]` come back marked as Samba's own sections | — |
+| `smbclient` | — | **absent**: Fedora splits it into its own package, and `smbd` alone is what makes a file server | — |
+| accounts read with `pdbedit` | — | through `sudo -n`; the database is root-only | — |
+| tui-containers engines | **none**: no docker, no podman | **podman 5.8.1**, rootless and — through `sudo -n` — root's scope: 2 of 2 expected | **none** |
+| container store | — | empty, and parsed as empty rather than skipped: no image is ever pulled | — |
+| docker | absent on every guest; no image in the lab ships it | same | same |
 
 ### Omarchy and `tui-snapper`
 
@@ -250,13 +257,26 @@ The run also gave the tool its first fixtures captured from real machines, one p
 
 ### Fedora and `tui-firewall`
 
-`tui-firewall`'s `firewalld` backend is a documented stub today: `internal/firewalld` satisfies the interface and every operation returns `ErrNotImplemented`. On the Fedora VM the smoke test therefore asserts the **failure**, in three parts:
+The `firewalld` backend used to be a documented stub, and the smoke test asserted the **failure**: `--backend firewalld --check` exited non-zero, auto-detection surfaced the stub error rather than claiming the machine had no firewall, and `firewalld` really was active — so the gap was asserted rather than skipped, with a note that the day someone implemented the backend the test would turn red and get rewritten.
 
-1. `--backend firewalld --check` exits non-zero and says "not implemented yet".
-2. Auto-detection finds firewalld and surfaces the same stub error, rather than claiming the machine has no firewall.
-3. `firewalld` really is `active` on that machine — so the stub is the tool's limitation, not an absent backend.
+That day came. The backend is real, the test was rewritten, and Fedora went from 3 assertions to **14**. It is now the only machine in the lab where the tool's write path is exercised at all, because it is the only one where a rule can be added and taken away again without changing how the guest behaves afterwards:
 
-The day someone implements the backend, that test turns red and gets rewritten. That is the point: the gap is asserted, not skipped.
+1. The default zone (`public`) is the first group, marked as the default, with its target and its `ssh` service parsed.
+2. `65530/tcp` is added **through the tool's own command path**, and `firewall-cmd --query-port` agrees it is there.
+3. The tool marks it as runtime only, and `--permanent --list-ports` confirms it never reached the permanent configuration — so a reboot undoes what the test did even if the test dies halfway.
+4. It is removed again, and both the tool and `--list-ports` agree it is gone.
+
+The other thing that run settled is a version question. The `internal/firewalld` fixtures were captured from firewall-cmd **2.3.2** on Fedora 42, and this guest runs **2.4.4**. Nothing was assumed about the two minor versions in between: the zone listing and the active-zone listing were captured verbatim from the guest and are now fixtures beside the older pair, with a unit test asserting both releases parse to the same key set. They do — `ingress-priority`, `egress-priority`, the tab-indented rich-rule continuation, all identical. The parser needed no change, and now there is a test that says so rather than a hope.
+
+### Fedora, and the two tools that had never met their backend
+
+`tui-samba` and `tui-containers` joined on the same sweep, and both were in the position `tui-cron` was in before `cronie`: the branch that matters had only ever run against fixtures.
+
+`tui-samba` found nothing wrong. Installing `samba` on the Fedora guest for one run put the present branch through a real `smbd` for the first time — the version probe answering 4.24.6, the shipped `smb.conf`, `[homes]` and `[printers]` coming back as Samba's own sections rather than as directories somebody exported, `security = USER`, and the root-only account database read through `sudo -n`. A share created by hand in a `mktemp -d`, validated with `testparm`, came back with its name, path and comment intact, and flipping `read only` moved the writable count. Twenty-one assertions, no change to the parser.
+
+`tui-containers` failed on two guests out of three, 15 assertions to 1, and the failure was worth the whole exercise. Neither Ubuntu nor Omarchy ships docker or podman, and the tool treated a machine with neither as an error: `NewReal` refused to build, `--check` exited 1 before it could report anything, and the fifteen assertions about the empty case all died on the same non-zero exit. The smoke test had documented the opposite contract since the day it was written — *a server that runs no containers is a normal server, the report is an empty engine list, the exit is 0* — and every screen below the front door was already written for it.
+
+`Load` had the same mistake one layer down, with a worse consequence: when an engine is installed and answers nothing, it threw away the model it had just built and with it each engine's reason for staying silent — the one fact that explains the empty screen. Nothing in the lab has a dead daemon, so that path had never run either, and the smoke test's docker branch asserts a reason it could not have received. Both return the model now. Fedora, which already had podman 5.8.1, exercised the present branch in the same run: both scopes answered, rootless with no privileges at all and root's through `sudo -n`, and an empty store was parsed as empty rather than skipped.
 
 ### The privileged reads, run for real for the first time
 
