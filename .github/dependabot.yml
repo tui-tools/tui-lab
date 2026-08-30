@@ -1,0 +1,21 @@
+# Dependabot for tui-lab.
+#
+# The lab is shell and virtual-machine definitions, with no Go module and no
+# package manifest, so the only thing here worth keeping current is whatever
+# actions its workflows use.
+#
+# No commit-message prefix is set on purpose: Dependabot's default subject
+# ("Bump x from a to b") already reads like the plain imperative sentences the
+# rest of the history is written in.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
