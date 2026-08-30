@@ -12,6 +12,7 @@
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
+#   lab.sh router up|down|status|test
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -253,8 +254,13 @@ cmd_images() {
 #            detection, which nothing here exercised before.
 #   omarchy  nothing. The image ships the server profile's firewall already,
 #            and installing into it would stop testing the shipped machine.
+#
+# A fourth argument names a router-topology role (router, lan-client,
+# wan-host) and replaces the distro payload with that role's prep: the seed
+# then also carries a network-config, because those guests have more than one
+# NIC and the addresses on them are the topology.
 write_seed() {
-  local distro="$1" name="$2" dir="$3"
+  local distro="$1" name="$2" dir="$3" role="${4:-}"
   local key; key="$(cat "$(lab_key).pub")"
   mkdir -p "$dir"
 
@@ -279,6 +285,9 @@ users:
 ssh_pwauth: false
 disable_root: true
 EOF
+    if [[ -n $role ]]; then
+      router_seed_payload "$role"
+    else
     case "$distro" in
       ubuntu)
         cat <<'EOF'
@@ -347,14 +356,22 @@ runcmd:
 EOF
         ;;
     esac
+    fi
   } >"$dir/user-data"
 
+  local netcfg=()
+  if [[ -n $role ]]; then
+    router_net_config "$role" "$name" >"$dir/network-config"
+    netcfg=(-N "$dir/network-config")
+  fi
+
   if command -v cloud-localds >/dev/null; then
-    cloud-localds "$dir/seed.iso" "$dir/user-data" "$dir/meta-data"
+    cloud-localds "${netcfg[@]}" "$dir/seed.iso" "$dir/user-data" "$dir/meta-data"
   else
     need xorriso
     xorriso -as mkisofs -quiet -V cidata -J -r \
-      -o "$dir/seed.iso" "$dir/user-data" "$dir/meta-data" 2>/dev/null
+      -o "$dir/seed.iso" "$dir/user-data" "$dir/meta-data" \
+      ${netcfg:+"$dir/network-config"} 2>/dev/null
   fi
 }
 
@@ -385,6 +402,31 @@ cmd_up() {
     return 0
   fi
 
+  vm_prepare_disks "$name" "$distro" "$dir" "$disk" "$data_disk"
+  [[ -f $dir/seed.iso ]] || write_seed "$distro" "$name" "$dir"
+
+  extra_nics=()
+  mgmt_mac=""
+  vm_launch "$name" "$dir" "$mem" "$cpus"
+
+  vm_wait_ssh "$name" "${WAIT:-900}"
+  # cloud-init's runcmd finishes after sshd is up, so the package prep is still
+  # running when the first connection succeeds. Waiting for it here is what
+  # makes `up` mean "ready to test".
+  # `sudo -n`, and not a bare call: on Fedora Cloud /run/cloud-init/cloud.cfg
+  # is root-only, so an unprivileged `cloud-init status --wait` dies on a
+  # PermissionError inside its own polling loop and never returns — `up` then
+  # hangs on a machine that finished minutes ago.
+  log "waiting for cloud-init to finish"
+  vm_ssh "$name" "sudo -n cloud-init status --wait >/dev/null 2>&1 || true; sudo -n cloud-init status --long 2>&1 | head -3" || true
+}
+
+# vm_prepare_disks materialises the per-VM root and data disks and the UEFI
+# variable store from the cached image. Split out of cmd_up so the router
+# topology, whose guests are named after their role rather than their distro,
+# builds its disks through the same code.
+vm_prepare_disks() {
+  local name="$1" distro="$2" dir="$3" disk="$4" data_disk="$5"
   local image; image="$(cmd_fetch "$distro" | tail -1)"
   mkdir -p "$dir"
 
@@ -414,8 +456,23 @@ cmd_up() {
   # for snapper goes. Nothing in the image touches it.
   [[ -f $dir/data.qcow2 ]] || qemu-img create -q -f qcow2 "$dir/data.qcow2" "${data_disk}G"
   [[ -f $dir/vars.qcow2 ]] || cp "$ovmf_dir/OVMF_VARS_4M.qcow2" "$dir/vars.qcow2"
-  [[ -f $dir/seed.iso ]] || write_seed "$distro" "$name" "$dir"
+}
 
+# vm_launch boots one prepared VM headless and daemonised. Every guest gets the
+# management NIC — user-mode networking with an ssh hostfwd, which is how the
+# lab talks to it — and anything in the `extra_nics` array is appended after it.
+# The router topology uses that array for the WAN and LAN segments; `up` leaves
+# it empty and boots exactly the single-NIC machine it always did.
+#
+# `mgmt_mac` is empty unless the caller sets it, and that is not a detail: a
+# guest whose cloud-init has already run carries a netplan file matching the
+# management NIC by the MAC it had on first boot, so handing that NIC a new
+# address on a later boot leaves the machine with no network at all. Only the
+# router guests, whose seed matches the MAC this script chose, set it.
+extra_nics=()
+mgmt_mac=""
+vm_launch() {
+  local name="$1" dir="$2" mem="$3" cpus="$4"
   local port; port="$(vm_port "$name")"
   qemu-system-x86_64 \
     -name "$name" -machine q35,accel=kvm -cpu host -smp "$cpus" -m "$mem" \
@@ -428,7 +485,8 @@ cmd_up() {
     -drive file="$dir/seed.iso",media=cdrom,if=none,format=raw,id=cdrom0 \
     -device ide-cd,drive=cdrom0,bus=ide.0 \
     -netdev user,id=net0,hostfwd=tcp:127.0.0.1:"$port"-:22 \
-    -device virtio-net-pci,netdev=net0 \
+    -device "virtio-net-pci,netdev=net0${mgmt_mac:+,mac=$mgmt_mac}" \
+    "${extra_nics[@]}" \
     -display none \
     -monitor unix:"$(vm_mon "$name")",server,nowait \
     -serial file:"$dir/serial.log" \
@@ -436,16 +494,16 @@ cmd_up() {
     -daemonize -pidfile "$dir/pid"
 
   log "started $name (ssh port $port, ${mem}M, ${cpus} cpu)"
-  vm_wait_ssh "$name" "${WAIT:-900}"
-  # cloud-init's runcmd finishes after sshd is up, so the package prep is still
-  # running when the first connection succeeds. Waiting for it here is what
-  # makes `up` mean "ready to test".
-  # `sudo -n`, and not a bare call: on Fedora Cloud /run/cloud-init/cloud.cfg
-  # is root-only, so an unprivileged `cloud-init status --wait` dies on a
-  # PermissionError inside its own polling loop and never returns — `up` then
-  # hangs on a machine that finished minutes ago.
-  log "waiting for cloud-init to finish"
-  vm_ssh "$name" "sudo -n cloud-init status --wait >/dev/null 2>&1 || true; sudo -n cloud-init status --long 2>&1 | head -3" || true
+}
+
+# vm_mac gives every NIC a stable address derived from the VM name and the NIC
+# index, inside the 52:54:00 range QEMU uses. Stability is what lets a guest's
+# cloud-init network-config match an interface by MAC and rename it, so the
+# rules a test writes can say `wan0` and `lan0` instead of guessing at
+# enp0sN ordering.
+vm_mac() {
+  local h; h=$(printf '%s' "$1" | cksum | cut -d' ' -f1)
+  printf '52:54:00:%02x:%02x:%02x\n' $(( (h / 256) % 256 )) $(( h % 256 )) "$2"
 }
 
 cmd_down() {
@@ -777,6 +835,532 @@ check_report() {
 }
 
 # ---------------------------------------------------------------------------
+# router: the two-network topology for the firewall work
+# ---------------------------------------------------------------------------
+# Three guests off the same cached cloud image the rest of the lab uses:
+#
+#   wan-host  ── wan ──  router  ── lan ──  lan-client
+#   10.90.0.20        .1 │ │ .1          10.91.0.30
+#                        (mgmt NICs, one per guest, carry ssh only)
+#
+# Each guest keeps the user-mode management NIC every lab VM has, so the lab
+# reaches it over the same ssh hostfwd as always and cloud-init can still
+# install packages. The topology itself is two more NICs per machine on QEMU
+# socket segments: a point-to-point TCP link on the loopback per network, which
+# needs no bridge, no tap and no root on the host. Two endpoints per link is
+# all the topology has, which is exactly what a socket netdev carries.
+#
+# The router boots with IP forwarding on, nftables installed and an empty
+# ruleset. Every rule in `router test` is written by the test itself: what is
+# being proven is that the topology forwards, translates and blocks the way a
+# filtering, NAT-ing, port-forwarding router has to, before any tui tool is in
+# the picture.
+
+router_wan_net="10.90.0.0/24"
+router_lan_net="10.91.0.0/24"
+router_wan_ip="10.90.0.1"
+router_lan_ip="10.91.0.1"
+wan_host_ip="10.90.0.20"
+lan_client_ip="10.91.0.30"
+wan_host_port=8080
+lan_client_port=8081
+
+# The two link sockets. They live on the loopback and are only meaningful while
+# the VMs are up; the ports are overridable so a second topology can coexist.
+router_wan_link="${LAB_WAN_LINK:-127.0.0.1:12090}"
+router_lan_link="${LAB_LAN_LINK:-127.0.0.1:12091}"
+
+# The distro under the three guests. Ubuntu because all three need nothing more
+# than nftables, curl and python3, and noble's cloud image has cloud-init's
+# netplan renderer, which is what turns the network-config below into named
+# `wan0`/`lan0` interfaces.
+router_distro="${LAB_ROUTER_DISTRO:-ubuntu}"
+
+# router_net_config renders the guest's cloud-init network-config. Interfaces
+# are matched by the MAC vm_launch gave them and renamed, so a rule can name
+# wan0 and lan0 and mean it.
+router_net_config() {
+  local role="$1" name="$2"
+  cat <<EOF
+version: 2
+ethernets:
+  mgmt:
+    match:
+      macaddress: "$(vm_mac "$name" 0)"
+    set-name: mgmt
+    dhcp4: true
+EOF
+  case "$role" in
+    router)
+      cat <<EOF
+  wan0:
+    match:
+      macaddress: "$(vm_mac "$name" 1)"
+    set-name: wan0
+    dhcp4: false
+    addresses: [$router_wan_ip/24]
+  lan0:
+    match:
+      macaddress: "$(vm_mac "$name" 2)"
+    set-name: lan0
+    dhcp4: false
+    addresses: [$router_lan_ip/24]
+EOF
+      ;;
+    wan-host)
+      # No route to the LAN on purpose: a reply that comes back from behind the
+      # router only ever reaches this machine because the router translated it,
+      # which is what makes the NAT check a real one.
+      cat <<EOF
+  wan0:
+    match:
+      macaddress: "$(vm_mac "$name" 1)"
+    set-name: wan0
+    dhcp4: false
+    addresses: [$wan_host_ip/24]
+EOF
+      ;;
+    lan-client)
+      # The default route is the router's LAN address. The management NIC keeps
+      # a default of its own at a worse metric so cloud-init can install
+      # packages before the router exists; `router up` deletes it once the
+      # guest is provisioned, so the machine the tests see has exactly one.
+      cat <<EOF
+    dhcp4-overrides:
+      route-metric: 200
+  lan0:
+    match:
+      macaddress: "$(vm_mac "$name" 1)"
+    set-name: lan0
+    dhcp4: false
+    addresses: [$lan_client_ip/24]
+    routes:
+      - to: default
+        via: $router_lan_ip
+        metric: 100
+EOF
+      ;;
+  esac
+}
+
+# router_seed_payload is the cloud-config body for one role, appended to the
+# identity block every seed in this lab shares.
+router_seed_payload() {
+  case "$1" in
+    router)
+      cat <<'EOF'
+package_update: true
+packages:
+  - nftables
+  - conntrack
+  - tcpdump
+  - curl
+write_files:
+  - path: /etc/sysctl.d/99-tui-lab-router.conf
+    content: |
+      net.ipv4.ip_forward=1
+runcmd:
+  - [sysctl, --system]
+  # ufw ships installed and inactive on the cloud image; making that explicit
+  # keeps the ruleset the tests write the only one in the machine.
+  - [bash, -c, "ufw disable >/dev/null 2>&1 || true"]
+  # nftables.service would restore /etc/nftables.conf at boot. The router is
+  # meant to come up with nothing loaded: the tests create every rule.
+  - [bash, -c, "systemctl disable --now nftables.service >/dev/null 2>&1 || true"]
+  - [bash, -c, "nft flush ruleset"]
+  - [bash, -c, "touch /run/tui-lab-ready"]
+EOF
+      ;;
+    wan-host)
+      cat <<EOF
+package_update: true
+packages:
+  - curl
+  - python3
+write_files:
+  - path: /srv/wan/index.html
+    content: |
+      tui-lab wan-host service
+  - path: /etc/systemd/system/wan-http.service
+    content: |
+      [Unit]
+      Description=tui-lab wan-host HTTP service
+      After=network.target
+
+      [Service]
+      # -u, or python block-buffers stderr when it is a file and the access log
+      # the NAT check reads stays empty until the process exits.
+      ExecStart=/usr/bin/python3 -u -m http.server $wan_host_port --directory /srv/wan
+      StandardOutput=append:/var/log/wan-http.log
+      StandardError=append:/var/log/wan-http.log
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [bash, -c, "ufw disable >/dev/null 2>&1 || true"]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, wan-http.service]
+  - [bash, -c, "touch /run/tui-lab-ready"]
+EOF
+      ;;
+    lan-client)
+      cat <<EOF
+package_update: true
+packages:
+  - curl
+  - python3
+write_files:
+  - path: /srv/lan/index.html
+    content: |
+      tui-lab lan-client service
+  - path: /etc/systemd/system/lan-http.service
+    content: |
+      [Unit]
+      Description=tui-lab lan-client HTTP service
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/bin/python3 -u -m http.server $lan_client_port --directory /srv/lan
+      StandardOutput=append:/var/log/lan-http.log
+      StandardError=append:/var/log/lan-http.log
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [bash, -c, "ufw disable >/dev/null 2>&1 || true"]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, lan-http.service]
+  - [bash, -c, "touch /run/tui-lab-ready"]
+EOF
+      ;;
+    *) die "unknown router role: $1" ;;
+  esac
+}
+
+# router_nics fills the extra_nics array for one role: the segments that guest
+# sits on. The router listens on both links and the two hosts connect to it, so
+# it has to be booted first — which is the order router_up uses.
+router_nics() {
+  local role="$1"
+  extra_nics=()
+  case "$role" in
+    router)
+      extra_nics+=(
+        -netdev "socket,id=wan,listen=$router_wan_link"
+        -device "virtio-net-pci,netdev=wan,mac=$(vm_mac router 1)"
+        -netdev "socket,id=lan,listen=$router_lan_link"
+        -device "virtio-net-pci,netdev=lan,mac=$(vm_mac router 2)"
+      )
+      ;;
+    wan-host)
+      extra_nics+=(
+        -netdev "socket,id=wan,connect=$router_wan_link"
+        -device "virtio-net-pci,netdev=wan,mac=$(vm_mac wan-host 1)"
+      )
+      ;;
+    lan-client)
+      extra_nics+=(
+        -netdev "socket,id=lan,connect=$router_lan_link"
+        -device "virtio-net-pci,netdev=lan,mac=$(vm_mac lan-client 1)"
+      )
+      ;;
+  esac
+}
+
+cmd_router_up() {
+  local mem=1536 cpus=2 disk=12
+  while (($#)); do
+    case "$1" in
+      --mem) mem="$2"; shift 2 ;;
+      --cpus) cpus="$2"; shift 2 ;;
+      --disk) disk="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  need qemu-system-x86_64 qemu-img ssh socat
+
+  local role dir
+  for role in router wan-host lan-client; do
+    dir="$(vm_dir "$role")"
+    if vm_running "$role"; then
+      log "$role already running (pid $(<"$dir/pid"))"
+      continue
+    fi
+    vm_prepare_disks "$role" "$router_distro" "$dir" "$disk" 1
+    [[ -f $dir/seed.iso ]] || write_seed "$router_distro" "$role" "$dir" "$role"
+    router_nics "$role"
+    mgmt_mac="$(vm_mac "$role" 0)"
+    vm_launch "$role" "$dir" "$mem" "$cpus"
+    vm_wait_ssh "$role" "${WAIT:-900}"
+    log "waiting for cloud-init to finish on $role"
+    vm_ssh "$role" "sudo -n cloud-init status --wait >/dev/null 2>&1 || true; sudo -n cloud-init status --long 2>&1 | head -3" || true
+  done
+
+  # The management NIC's own default route exists so cloud-init could reach the
+  # archive. Now that the guest is provisioned it would be a second way out of
+  # the LAN, and the point of the client is that its only way out is the router.
+  # 10.0.2.2 is QEMU's user-mode gateway, the same on every guest.
+  log "pointing lan-client's default route at the router"
+  vm_ssh lan-client "sudo -n ip -4 route del default via 10.0.2.2 2>/dev/null || true; ip -4 route show default" || true
+
+  cmd_router_status
+}
+
+cmd_router_down() {
+  local role
+  for role in lan-client wan-host router; do cmd_down "$role"; done
+}
+
+cmd_router_status() {
+  cmd_status router lan-client wan-host
+  printf 'links    wan %s (%s)   lan %s (%s)\n' \
+    "$router_wan_link" "$router_wan_net" "$router_lan_link" "$router_lan_net"
+  local role
+  for role in router lan-client wan-host; do
+    vm_running "$role" || continue
+    printf '%s:\n' "$role"
+    vm_ssh "$role" "ip -brief -4 addr show | grep -v '^lo '" 2>/dev/null | sed 's/^/  /' \
+      || echo "  (no ssh)"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# router test: the topology proves itself, before any tool touches it
+# ---------------------------------------------------------------------------
+# Every rule below is hand-written nft, applied over ssh. That is the point:
+# these checks are the yardstick a tool that writes the same rules is measured
+# against, so they must hold with no tui binary anywhere near the machine.
+
+rt_rc=0
+rt_log=""
+
+rt_say() { echo "$*"; printf '%s\n' "$*" >>"$rt_log"; }
+
+# rt_run runs one command in a guest, echoes its output for the caller to test
+# and records the command, the output and the exit status as evidence.
+rt_run() {
+  local vm="$1"; shift
+  local body status=0
+  body="$(vm_ssh "$vm" "$@" </dev/null 2>&1)" || status=$?
+  {
+    echo "\$ [$vm] $*"
+    printf '%s\n' "$body" | sed 's/^/  /'
+    echo "  (exit $status)"
+  } >>"$rt_log"
+  printf '%s' "$body"
+  return $status
+}
+
+rt_verdict() {
+  local label="$1" ok="$2"
+  if ((ok == 0)); then rt_say "PASS  $label"; else rt_say "FAIL  $label"; rt_rc=1; fi
+}
+
+# rt_nft replaces the router's whole ruleset with the one it is given, so each
+# stage starts from a ruleset the evidence file spells out in full. The text
+# goes in over stdin rather than inside the remote command line: a ruleset is
+# full of quotes and braces and nothing survives being quoted twice.
+rt_nft() {
+  local ruleset="$1" body status=0
+  body="$(printf '%s\n' "$ruleset" \
+    | vm_ssh router "sudo -n nft flush ruleset && sudo -n nft -f -" 2>&1)" || status=$?
+  {
+    echo "\$ [router] nft -f - <<'EOF'"
+    printf '%s\n' "$ruleset" | sed 's/^/  /'
+    echo "  EOF"
+    [[ -z $body ]] || printf '%s\n' "$body" | sed 's/^/  /'
+    echo "  (exit $status)"
+  } >>"$rt_log"
+  # A ruleset the router refuses is a failure of the run, not a reason to stop
+  # it: the checks that follow report what that ruleset was supposed to do.
+  if ((status)); then
+    rt_say "FAIL  the router refused the ruleset above"
+    rt_rc=1
+  fi
+  return 0
+}
+
+rt_curl() { # rt_curl <vm> <url> — short timeout, so a dropped packet fails fast
+  rt_run "$1" "curl -sS --max-time 6 '$2'"
+}
+
+cmd_router_test() {
+  local role
+  for role in router lan-client wan-host; do
+    vm_running "$role" || die "$role is not running (lab.sh router up)"
+  done
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-router"
+  mkdir -p "$logdir"
+  rt_log="$logdir/topology.log"
+  {
+    echo "### router topology — $(date -Is)"
+    echo "wan $router_wan_net: router $router_wan_ip, wan-host $wan_host_ip:$wan_host_port"
+    echo "lan $router_lan_net: router $router_lan_ip, lan-client $lan_client_ip:$lan_client_port"
+  } >"$rt_log"
+
+  local body ok
+
+  # -- 1. the router sits on both segments ----------------------------------
+  body="$(rt_run router "ip -brief -4 addr show wan0; ip -brief -4 addr show lan0; sysctl -n net.ipv4.ip_forward")" || true
+  ok=1
+  grep -q "$router_wan_ip/24" <<<"$body" && grep -q "$router_lan_ip/24" <<<"$body" \
+    && [[ $(tail -1 <<<"$body") == 1 ]] && ok=0
+  rt_verdict "router has wan0 $router_wan_ip, lan0 $router_lan_ip and forwarding on" "$ok"
+
+  ok=0; rt_run router "ping -c2 -W2 $wan_host_ip >/dev/null && ping -c2 -W2 $lan_client_ip >/dev/null" >/dev/null || ok=1
+  rt_verdict "router reaches both networks (wan-host and lan-client answer)" "$ok"
+
+  # -- 2. the client's way out is the router --------------------------------
+  body="$(rt_run lan-client "ip -4 route show default; echo ---; ip -4 route get $wan_host_ip")" || true
+  ok=1
+  if [[ $(grep -c '^default' <<<"$body") == 1 ]] \
+    && grep -q "^default via $router_lan_ip" <<<"$body" \
+    && grep -q "via $router_lan_ip" <<<"$(sed -n '/^---/,$p' <<<"$body")"; then ok=0; fi
+  rt_verdict "lan-client has one default route and it is the router" "$ok"
+
+  ok=0; rt_curl router "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "wan-host serves HTTP on the wan segment" "$ok"
+
+  # -- 3. NAT ---------------------------------------------------------------
+  # With an empty ruleset the router still forwards, but wan-host has no route
+  # back to the LAN, so nothing returns. That is the honest "before" state.
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+  ok=1; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "without masquerade lan-client cannot reach wan-host" "$ok"
+
+  rt_run wan-host "sudo -n truncate -s 0 /var/log/wan-http.log" >/dev/null
+  rt_nft "table ip lab {
+  chain nat_post {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname \"wan0\" ip saddr $router_lan_net counter masquerade
+  }
+}"
+  ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "with masquerade lan-client reaches wan-host" "$ok"
+
+  body="$(rt_run wan-host "sudo -n cat /var/log/wan-http.log")" || true
+  ok=1
+  grep -q "^$router_wan_ip " <<<"$body" && ! grep -q "$lan_client_ip" <<<"$body" && ok=0
+  rt_verdict "wan-host logged the request from the router's wan address, not the client's" "$ok"
+
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+  ok=1; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "with the masquerade rule removed lan-client is cut off again" "$ok"
+
+  # -- 4. forward filtering and its counters --------------------------------
+  rt_nft "table ip lab {
+  chain nat_post {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname \"wan0\" ip saddr $router_lan_net counter masquerade
+  }
+  chain filter_fwd {
+    type filter hook forward priority filter; policy drop;
+  }
+}"
+  ok=1; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "a forward chain with policy drop stops LAN to WAN traffic" "$ok"
+
+  rt_run router "sudo -n nft add rule ip lab filter_fwd ct state established,related counter accept
+sudo -n nft add rule ip lab filter_fwd iifname \"lan0\" oifname \"wan0\" counter accept" >/dev/null
+  ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "the forward rule lets LAN to WAN through" "$ok"
+
+  body="$(rt_run router "sudo -n nft list chain ip lab filter_fwd")" || true
+  ok=1
+  [[ $(grep 'iifname "lan0"' <<<"$body" | sed -n 's/.*counter packets \([0-9]*\).*/\1/p') -gt 0 ]] && ok=0
+  rt_verdict "the forward rule's packet counter moved" "$ok"
+
+  # -- 5. an input rule on the router itself --------------------------------
+  rt_nft "table ip lab {
+  chain filter_in {
+    type filter hook input priority filter; policy accept;
+    iifname \"wan0\" ip saddr $wan_host_ip icmp type echo-request counter drop
+  }
+}"
+  ok=1; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=0
+  rt_verdict "an input rule blocks wan-host from reaching the router" "$ok"
+
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+  ok=0; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=1
+  rt_verdict "removing the input rule lets wan-host reach the router again" "$ok"
+
+  # -- 6. an output rule on the router itself -------------------------------
+  rt_nft "table ip lab {
+  chain filter_out {
+    type filter hook output priority filter; policy accept;
+    oifname \"wan0\" ip daddr $wan_host_ip tcp dport $wan_host_port counter reject
+  }
+}"
+  ok=1; rt_curl router "http://$wan_host_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "an output rule blocks the router's own traffic to wan-host" "$ok"
+
+  # -- 7. a named set standing in for an alias ------------------------------
+  # nft's named sets are the backend an alias has to compile to: one object,
+  # referenced by rules, whose membership changes without rewriting the rule.
+  rt_nft "table ip lab {
+  set hostile {
+    type ipv4_addr
+    elements = { $wan_host_ip }
+  }
+  chain filter_in {
+    type filter hook input priority filter; policy accept;
+    iifname \"wan0\" ip saddr @hostile counter drop
+  }
+}"
+  ok=1; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=0
+  rt_verdict "a rule matching a named set blocks the address in it" "$ok"
+
+  rt_run router "sudo -n nft delete element ip lab hostile { $wan_host_ip }" >/dev/null
+  ok=0; rt_run wan-host "ping -c2 -W2 $router_wan_ip" >/dev/null || ok=1
+  rt_verdict "updating the set propagates to the rule without touching the rule" "$ok"
+
+  # -- 8. DNAT --------------------------------------------------------------
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+  ok=1; rt_curl wan-host "http://$router_wan_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "before the port forward the router's wan address serves nothing" "$ok"
+
+  rt_nft "table ip lab {
+  chain nat_pre {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname \"wan0\" tcp dport $wan_host_port counter dnat to $lan_client_ip:$lan_client_port
+  }
+  chain nat_post {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname \"wan0\" ip saddr $router_lan_net counter masquerade
+  }
+}"
+  ok=0; rt_curl wan-host "http://$router_wan_ip:$wan_host_port/" | grep -q 'lan-client service' || ok=1
+  rt_verdict "the port forward exposes the lan-client service on the router's wan address" "$ok"
+
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+  ok=1; rt_curl wan-host "http://$router_wan_ip:$wan_host_port/" >/dev/null || ok=0
+  rt_verdict "removing the port forward closes it again" "$ok"
+
+  # The router is left as `up` handed it over: forwarding on, ruleset empty.
+  rt_run router "sudo -n nft list ruleset" >/dev/null
+
+  echo
+  if ((rt_rc)); then rt_say "VERDICT  router topology: FAIL"; else rt_say "VERDICT  router topology: PASS"; fi
+  log "evidence: $rt_log"
+  return $rt_rc
+}
+
+cmd_router() {
+  local sub="${1:?up|down|status|test}"; shift || true
+  case "$sub" in
+    up) cmd_router_up "$@" ;;
+    down) cmd_router_down ;;
+    status) cmd_router_status ;;
+    test) cmd_router_test ;;
+    *) die "router: expected up, down, status or test" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
 # The header block above is the usage text: printed from line 2 until the
@@ -797,6 +1381,7 @@ case "$cmd" in
   images) cmd_images ;;
   test) cmd_test "${1:?tool}" "${@:2}" ;;
   report) cmd_report "${1:?tool|all}" "${@:2}" ;;
+  router) cmd_router "$@" ;;
   all)
     sub="${1:?up|down|status}"; shift
     case "$sub" in
