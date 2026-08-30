@@ -247,7 +247,9 @@ cmd_images() {
 #   fedora   firewalld is already installed and running; snapper + the same
 #            btrfs data disk, mounted with an SELinux context because Fedora
 #            Cloud is enforcing out of the box; policycoreutils so the SELinux
-#            state is inspectable.
+#            state is inspectable; cronie, so that one machine in the lab is a
+#            `crond.service` machine — the other half of tui-cron's unit-name
+#            detection, which nothing here exercised before.
 #   omarchy  nothing. The image ships the server profile's firewall already,
 #            and installing into it would stop testing the shipped machine.
 write_seed() {
@@ -311,8 +313,17 @@ packages:
   # Base image either. The lab renders every --demo frame through it, so
   # without this the frame check fails on Fedora alone.
   - util-linux-script
+  # cron is not in the Cloud Base image either, so before this the lab had no
+  # machine whose cron daemon is called `crond` — Ubuntu's is `cron.service`
+  # and Omarchy has none — and half of tui-cron's unit-name detection was
+  # covered only by fixtures. cronie is Fedora's cron, and it brings
+  # /etc/cron.d/0hourly and /etc/crontab with it.
+  - cronie
 runcmd:
   - [bash, -c, "systemctl enable --now firewalld"]
+  # cronie's unit is not enabled by the package, and a cron daemon that is
+  # installed but stopped is a different machine from the one being tested.
+  - [bash, -c, "systemctl enable --now crond"]
   - [bash, -c, "firewall-cmd --permanent --add-service=ssh && firewall-cmd --reload"]
   # Fedora Cloud is SELinux-enforcing, and a fresh filesystem under /srv
   # inherits var_t. snapper then fails every `create` with "IO Error (mkdir

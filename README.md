@@ -14,7 +14,7 @@ It is glue, so it is one bash script.
 | VM | Image | Firewall | Snapshots | Notes |
 |----|-------|----------|-----------|-------|
 | `ubuntu` | Ubuntu 24.04 LTS cloud image | `ufw`, enabled with 22 allowed | `snapper` on a btrfs data disk | **Root is ext4**, so snapper gets `/dev/vdb` |
-| `fedora` | Fedora Cloud Base Generic 44 | `firewalld`, installed by the seed | `snapper` on a btrfs data disk, mounted with an SELinux `context=` | **Root is btrfs**; SELinux **enforcing** |
+| `fedora` | Fedora Cloud Base Generic 44 | `firewalld`, installed by the seed | `snapper` on a btrfs data disk, mounted with an SELinux `context=` | **Root is btrfs**; SELinux **enforcing**; `cronie`, so the lab has one `crond.service` machine |
 | `omarchy` | [Omarchy Server](https://github.com/edimarlnx/omarchy-server) cloud image | `ufw`, already `limit 22/tcp` | `snapper` ships in the image | Root is btrfs; seeded with **nothing** |
 
 The Omarchy VM installs no packages on purpose. The point of that machine is the image exactly as shipped; adding to it would stop testing the artifact.
@@ -33,6 +33,7 @@ Two things worth knowing before you assume otherwise, both found by building thi
 
 - **Fedora Cloud Base Generic ships no firewall.** `rpm -q firewalld` reports "not installed" on 44-1.7. The seed installs it.
 - **Fedora Cloud Base Generic ships no `script(1)`.** It is split into `util-linux-script`, which the minimised image leaves out. The seed installs it, because the lab renders every TUI frame through a pty.
+- **Fedora Cloud Base Generic ships no cron**, neither `cron` nor `cronie`. That left the lab with no machine whose cron daemon is called `crond` — Ubuntu's is `cron.service` and Omarchy has none — so half of `tui-cron`'s unit-name detection was covered only by fixtures. The seed installs `cronie` and enables `crond`, which the package does not do for you.
 - **A btrfs volume made under `/srv` inherits `var_t`, and snapper cannot write to it.** Every `snapper create` fails with `IO Error (mkdir failed errno:13 (Permission denied))` and *no AVC is logged*, because auditd is not running in the Cloud image either. The seed mounts the data disk with `context=system_u:object_r:snapperd_data_t:s0` — the label the root filesystem's own `/.snapshots` carries. A `chcon` on `.snapshots` alone did not survive.
 - **`cloud-init status --wait` must be run with `sudo`.** `/run/cloud-init/cloud.cfg` is root-only on Fedora Cloud, and the unprivileged call dies on a `PermissionError` inside its own polling loop rather than returning, so `up` hangs on a machine that finished minutes ago.
 
@@ -137,7 +138,7 @@ That is what makes assertions like "the tool's active-unit count equals `systemc
 
 ## Results from a real run
 
-Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row was re-run on `2026-08-30`, and `tui-logs`, `tui-cron` and `tui-cert` joined on `2026-08-30`.
+Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row was re-run on `2026-08-30`, and `tui-logs`, `tui-cron` and `tui-cert` joined on `2026-08-30`. The Fedora VM was then **rebuilt from the seed with `cronie`** and `tui-cron` re-run against all three on `2026-08-30`, so its row and the cron facts below come from the rebuilt machine; the other Fedora figures were measured before it and have not been re-taken.
 
 ```bash
 ./lab.sh all up
@@ -168,7 +169,7 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`; the `tui-update` row 
 | **tui-disk** | version, demo frame, smoke **13/13** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
 | **tui-update** | version, demo frame, smoke **12/12** | version, demo frame, smoke **11/11** | version, demo frame, smoke **13/13** — see below |
 | **tui-logs** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** |
-| **tui-cron** | version, demo frame, smoke **16/16** | version, demo frame, smoke **15/15** | version, demo frame, smoke **15/15** |
+| **tui-cron** | version, demo frame, smoke **18/18** | version, demo frame, smoke **18/18** | version, demo frame, smoke **19/19** — see below |
 | **tui-cert** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** |
 
 Backend coverage behind those numbers:
@@ -219,9 +220,12 @@ Backend coverage behind those numbers:
 | journal storage | persistent (`/var/log/journal`) | persistent | persistent |
 | errors in the last hour | 0, matching `journalctl -p err` | 16, matching | 4, matching |
 | tui-cron backend version | `systemd 255` | `systemd 259` | `systemd 261` |
-| timers parsed | 20, matching `systemctl list-units` | 5, matching | 4, matching |
-| cron | **`cron`**, unit `cron.service`, running | **absent**: Fedora Cloud ships neither `cron` nor `cronie` | **absent** |
-| jobs across the five kinds | 36 | 7 | 4 |
+| timers parsed | 20, matching `systemctl list-units` | 4, matching | 4, matching |
+| cron | **`cron`**, unit `cron.service`, running | **`cronie` 1.7.2**, unit `crond.service`, running | **absent**: no `crontab`, no `/etc/crontab` |
+| `/etc/crontab` + `/etc/cron.d` job lines | 8, matching the tables | 1, `/etc/cron.d/0hourly` | 0 |
+| this account's `crontab -l` | empty, and read as empty rather than as a failed read | same, from cronie's exit 1 | — |
+| run-parts scripts | 7, matching the `cron.*` directories | 1, `cron.hourly/0anacron` | 1, `cron.hourly/snapper`, **listed as unrunnable** |
+| jobs across the five kinds | 36 | 8 | 5 |
 | tui-cert backend version | openssl 3.0.13 | openssl 3.5.5 | openssl 3.6.4 |
 | ACME client | **none**: no `certbot`, no `acme.sh` | same | same |
 | certificates found | 0 — no guest ships one | 0 | 0 |
@@ -306,7 +310,27 @@ One gap the lab cannot close: **no guest has SMART**. Every disk is virtio, none
 Two facts the run established that were previously assumed:
 
 - **`journalctl --list-boots -o json` is the same shape on systemd 255, 259 and 261** — `index`, `boot_id`, `first_entry`, `last_entry`, no additions. That is the one read in `tui-logs` gated on a version, and the gate is at 252, so the whole tested range is above it and the table fallback never ran here. Both ends are now fixtures captured from the guests (`list-boots-json-systemd{255,261}.txt`), so a future release that changes the shape fails a unit test rather than a screen.
-- **Fedora Cloud Base ships neither `cron` nor `cronie`**, so two of the three guests exercise `tui-cron`'s cron-absent branch and only Ubuntu exercises the present one. Ubuntu's unit is `cron.service`; nothing in the lab is a `crond.service` machine, so that half of the unit-name detection is still covered only by fixtures.
+- **Fedora Cloud Base ships neither `cron` nor `cronie`**, so two of the three guests exercised `tui-cron`'s cron-absent branch and only Ubuntu exercised the present one. Ubuntu's unit is `cron.service`; nothing in the lab was a `crond.service` machine, so that half of the unit-name detection was covered only by fixtures. The seed installs `cronie` now — see below.
+
+### Fedora, cronie, and the machine that has cron.hourly and no cron
+
+The line above is what made the seed grow a `cronie` entry: `tui-cron`'s whole `crond` branch — the unit name, the tables cronie ships, its `crontab -l` — had never run on a machine, only against fixtures reconstructed from a developer's Fedora box. The Fedora VM was rebuilt from the seed with `cronie` installed and `crond` enabled, and the suite re-run on all three guests.
+
+**Every fixture turned out to be right.** `/etc/crontab` and `/etc/cron.d/0hourly` on Fedora 44 are byte-for-byte what `internal/crontab/testdata` already held; `crontab -V` really answers `cronie 1.7.2`; the unit is `crond.service` and the tool named it. That is a genuine result — the reconstruction was faithful — and it is the first time anyone could say so.
+
+What the run did change is the **suite**, and through it the tool.
+
+- **The cron-present branch was three assertions that could not fail.** `"cron.d": [0-9]+` and `"crontab": [0-9]+` pass on a machine whose tables were never opened, because zero is a number. They are counts now, computed on the guest from the files themselves — job lines are the ones starting with a digit, a `*` or an `@`, everything else in those files being a comment or a `SHELL=`/`PATH=`/`MAILTO=` assignment. Ubuntu's tables carry 8 and Fedora's carry exactly 1, the `01 * * * * root run-parts /etc/cron.hourly` in `0hourly`, and the tool has to produce that number and not merely a number.
+
+- **cronie answers `crontab -l` with "no crontab for lab" on stderr and exit 1** when there is no table. The backend reads that as an empty table rather than a failed read, which is right and was untested; the suite now demands the count match whatever `crontab -l` really holds, and that the rest of the report survive the non-zero exit.
+
+- **A fresh cron machine's journal has no jobs in it, only cronie announcing itself** — `(CRON) STARTUP (1.7.2)` and three `(CRON) INFO` lines. Every one of them names CRON and none is a job, so a parser keyed on the daemon's name rather than on the `CMD (` marker would read four outcomes off a machine where nothing has run. It is captured as `journal-crond-fedora44-boot.txt` and asserted to produce no log lines at all.
+
+Then the strengthened suite found a real bug, and not on Fedora:
+
+- **Omarchy Server ships `/etc/cron.hourly/snapper` and no cron.** No `crontab` binary, no `/etc/crontab`, no unit. `tui-cron`'s `Load` bailed out before walking the run-parts directories whenever both of those were missing, so it reported that machine as having no cron jobs whatsoever — while a snapshot script sits in `cron.hourly` looking perfectly scheduled and never running. That is the one answer a scheduler viewer must not give: the whole value of listing that file is to say it will not fire. The directories need no daemon to read, so they are read unconditionally now, and on a machine with no cron each row comes back `Active: false` with *this script is installed but nothing runs it*. Omarchy went from 4 jobs to 5, and from 15 checks to 19.
+
+The suite also grew one assertion that holds on all three: the `anacron-dir` count equals the executables in the four `cron.*` directories — 7 on Ubuntu, 1 on Fedora, 1 on Omarchy. It is the same shape of check as the timer count, and it is what caught the bug.
 
 Nothing in these three suites writes: no crontab is installed, no timer enabled, no certificate issued, no journal vacuumed. `tui-cert` generates a throwaway key pair with `openssl` in a `mktemp -d` it removes on exit, which is the only file any of them creates.
 
