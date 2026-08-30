@@ -107,6 +107,16 @@ Around it, the lab runs three checks that need no cooperation from the tool:
 
 A tool with no `test/smoke.sh` still gets checks 1 and 2, reported as `SKIP smoke`.
 
+### Compatibility results come back in the log
+
+A smoke test may also print one line per run behind a `compat-result:` prefix:
+
+```text
+compat-result: {"backend":"ufw","date":"2026-08-30","distro":"ubuntu-24.04","result":"pass","suite":"smoke","tool":"tui-firewall","version":"0.36.2"}
+```
+
+The version in it is the one the **tool itself probed** on that guest, not one the tester assumed, and the distro is `$(. /etc/os-release; echo $ID-$VERSION_ID)`. The lab needs to know nothing about this: the line rides out in the per-VM log under `out/results/`, and back in the tool's repository `make compat` harvests those logs into `compat/results.jsonl` and regenerates the tested-version list in `tool.json`. That is where a tool's compatibility claims come from — a run on a real machine, not an assertion in a README. See [tui-kit/docs/compatibility.md](https://github.com/tui-tools/tui-kit/blob/main/docs/compatibility.md).
+
 ### `--check`, the non-interactive read path
 
 A TUI has nothing a test can assert on. `tui-firewall`, `tui-systemd` and `tui-snapper` therefore grew a `--check` flag: it runs the backend's **real read path**, prints the parsed model as JSON, and exits 0 or 1. It never builds and never runs a mutation, so it is safe anywhere.
@@ -149,6 +159,8 @@ Backend coverage behind those numbers:
 |---|---|---|---|
 | tui-firewall backend | `ufw` (real) | `firewalld` (**stub**) | `ufw` (real) |
 | rules parsed | 2, matching `ufw status numbered` | — | 2, matching `ufw status numbered` |
+| tui-firewall backend version | `ufw 0.36.2` | — | `ufw 0.36.2` |
+| tui-systemd backend version | `systemd 255` | `systemd 259` | `systemd 261` |
 | tui-systemd units parsed | 543 | 497 | 478 |
 | active units | 271, matching `systemctl` | 217, matching `systemctl` | 203, matching `systemctl` |
 | journal read | `ModemManager.service` | `NetworkManager-wait-online.service` | `cloud-config.service` |
