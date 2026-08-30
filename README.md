@@ -145,6 +145,11 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
 ./lab.sh test tui-systemd
 ./lab.sh test tui-snapper
 ./lab.sh test tui-network
+./lab.sh test tui-secure
+./lab.sh test tui-users
+./lab.sh test tui-ssh
+./lab.sh test tui-disk
+./lab.sh test tui-update
 ./lab.sh all down
 ```
 
@@ -154,6 +159,11 @@ Fedora host, KVM, three VMs at the defaults, `2026-08-29`.
 | **tui-systemd** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** |
 | **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **15/15** | version, demo frame, smoke **17/17** |
 | **tui-network** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** |
+| **tui-secure** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **22/22** |
+| **tui-users** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** |
+| **tui-ssh** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
+| **tui-disk** | version, demo frame, smoke **13/13** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
+| **tui-update** | version, demo frame, smoke **11/11** | version, demo frame, smoke **10/10** | version, demo frame, smoke **2/12** — see below |
 
 Backend coverage behind those numbers:
 
@@ -175,6 +185,20 @@ Backend coverage behind those numbers:
 | routes parsed | 4, matching `ip -j route` | 2, matching `ip -j route` | 4, matching `ip -j route` |
 | managed links | 1 | **0**, every link read-only | 1 |
 | `.network` file of the managed link | `/run/systemd/network/10-netplan-enp0s4.network` | — | `/etc/systemd/network/20-wired.network` |
+| tui-secure MAC layer | AppArmor | SELinux | none (probe answers `unknown`) |
+| tui-secure firewall / updates | `ufw` / `debian` | `firewalld` / `fedora` | `ufw` / `arch` |
+| tui-secure backend versions | ufw 0.36.2, OpenSSH 9.6, systemd 255 | firewalld 2.4.4, OpenSSH 10.2, systemd 259 | ufw 0.36.2, OpenSSH 10.5, systemd 261 |
+| tui-users accounts / groups | 33 / 62, matching `getent` | 26 / 47, matching `getent` | 20 / 53, matching `getent` |
+| `ALL` lines in `/etc/sudoers` | 3 | 3 | 1 |
+| tui-users key read | fingerprint matches `ssh-keygen -lf`, through `sudo -n` | same | same |
+| tui-ssh unit | `ssh` | `sshd` | `sshd` |
+| `sshd -T` casing | lower (`permitrootlogin`) | lower (`permitrootlogin`) | **canonical** (`PermitRootLogin`) |
+| `PermitRootLogin`, matching `sshd -T` | `without-password` | `prohibit-password` | `no` |
+| tui-disk root filesystem | **ext4** | btrfs | btrfs |
+| btrfs section covers | `/srv/data`, **not** the root | `/` | `/` |
+| devices parsed | 7, matching `lsblk` | 7, matching `lsblk` | 6, matching `lsblk` |
+| tui-disk backend versions | util-linux 2.39.3, btrfs-progs 6.6.3 | util-linux 2.41.5, btrfs-progs 6.19.1 | util-linux 2.42.2, btrfs-progs 7.1 |
+| SMART | none: virtio disks carry none, and no guest has smartmontools | same | same |
 
 ### Omarchy and `tui-snapper`
 
@@ -201,6 +225,38 @@ The run also gave the tool its first fixtures captured from real machines, one p
 3. `firewalld` really is `active` on that machine — so the stub is the tool's limitation, not an absent backend.
 
 The day someone implements the backend, that test turns red and gets rewritten. That is the point: the gap is asserted, not skipped.
+
+### The privileged reads, run for real for the first time
+
+`tui-secure`, `tui-users`, `tui-ssh` and `tui-disk` joined the lab together, and they are the first tools whose escalated branches — `sshd -T`, `getent shadow`, `sudo -l`, another account's `authorized_keys` — had ever run against a live backend rather than a fixture. Every guest gives `lab` passwordless `sudo -n`, so all of them executed.
+
+`tui-secure` passed on all three machines unchanged: every one of its eight probes answered, the MAC layer came back as AppArmor on Ubuntu and SELinux on Fedora, and on Omarchy — which ships neither — the probe reported `unknown` rather than a silent ok. No password hash reached the report on any of them.
+
+The other three each had a bug, and in all three cases the bug was in the **test**, which is its own lesson: a smoke test that has only ever been read is as unproven as the code it covers.
+
+- **`tui-users`** wrote an invented ed25519 blob into `authorized_keys` and asked `ssh-keygen` to fingerprint the file. `ssh-keygen` refuses a file containing a key it cannot decode, so the check failed on all three guests and told us nothing about the tool. Worse, it had been aimed at `ssh-keygen` rather than at `tui-users`, and could not have been aimed at the tool: authorized keys, sudo rules and aging are read by the backend's *detail* path, which only the UI ever called. `--check` grew a `--user <name>` flag, and the test now demands back the exact fingerprint `ssh-keygen` computes for a real key it just generated — which proves the escalated read of a mode 600 file inside somebody else's mode 700 directory, and the parse.
+
+- **`tui-ssh`** met a change in `sshd` itself. **OpenSSH 10.5** prints `sshd -T` in the canonical spelling — `PermitRootLogin no` — where **9.6 and 10.2** lower-case every keyword. The tool canonicalises and parsed all three correctly; the smoke test's `sed` on a lowercase keyword found nothing on Omarchy, so it *skipped* its own strongest assertion on the one machine in the lab that keeps root out entirely, and reported a pass. A real `sshd -T` from 10.5 is now a fixture in `tui-ssh/internal/openssh/testdata/sshd-T-openssh105.txt`.
+
+- **`tui-disk`** had a whole branch that had never executed. Ubuntu is the only guest whose root is **ext4** with btrfs mounted somewhere else, which is exactly the case that proves the btrfs section follows the filesystem and not the root — and the branch for it looked for that filesystem at `/mnt/btrfs`, which nothing mounts. The lab puts the data disk on `/srv/data`. The test now asks `findmnt` where btrfs is, and Ubuntu went from 8 checks to 13.
+
+### Omarchy and `tui-update`
+
+`tui-update` is the one tool the lab currently fails, and it fails on the machine it most needs to work on. Omarchy Server 4.0.1 ships `checkupdates` — it comes with `pacman-contrib` — but **not `fakeroot`**, which `checkupdates` needs to build its temporary database. So:
+
+```console
+$ tui-update --check
+tui-update: pacman read failed: `/usr/bin/sudo -n checkupdates` failed:
+==> ERROR: Cannot find the fakeroot binary
+```
+
+`--check` exits 1 and the whole report is empty, which takes ten of the twelve assertions down with it — the pending count, the restart class, the snapshot support the machine really does have, the pacman log. Only `--version` and the `--demo` frame pass.
+
+Nothing about that is the lab's doing: it is the shipped image, unmodified, which is the entire point of the Omarchy VM. Either `checkupdates` needs a fallback for a machine without `fakeroot`, or the read needs to degrade to a reported reason instead of failing the whole model — a machine whose update count cannot be determined still has a snapshot configuration, a timer and a history worth showing. That is `tui-update`'s call to make; the lab's job was to find it, and the result is recorded here rather than smoothed over.
+
+Ubuntu (apt 2.8.3) and Fedora (dnf 5.4.1) pass 11/11 and 10/10. Fedora skips one: `needs-restarting` lives in `dnf-plugins-core`, which the Cloud image leaves out.
+
+One gap the lab cannot close: **no guest has SMART**. Every disk is virtio, none of the three images ships `smartmontools`, so `tui-disk`'s health read is asserted only in its absence — each drive must come back `unknown` *with a reason*, which is at least distinguishable from a read the tool forgot to make.
 
 ## License
 
