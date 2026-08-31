@@ -1703,6 +1703,35 @@ sudo -n nft add rule ip lab filter_fwd iifname \"lan0\" oifname \"wan0\" counter
   ok=1; rt_curl wan-host "http://$router_wan_ip:$wan_host_port/" >/dev/null || ok=0
   rt_verdict "removing the port forward closes it again" "$ok"
 
+  # -- 10. per-rule logging reaches the real kernel log (router item 10) -----
+  # The live firewall-log view reads the kernel log that nftables' `log`
+  # statement writes. A rootless netns never delivers those lines to the
+  # kernel, so per-rule logging can only be proven on a real machine — which is
+  # exactly what the lab twin is for. Build a working masquerade path whose
+  # lan0->wan0 accept rule is logged, cause the traffic it matches, and read
+  # the line back off the router's own kernel ring.
+  rt_nft "table ip lab {
+  chain nat_post {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname \"wan0\" ip saddr $router_lan_net counter masquerade
+  }
+  chain filter_fwd {
+    type filter hook forward priority filter; policy drop;
+    ct state established,related counter accept
+    iifname \"lan0\" oifname \"wan0\" log prefix \"tuilab-fwd \" counter accept
+  }
+}"
+  # Clear the router's kernel ring so the assertion only sees traffic we cause.
+  rt_run router "sudo -n dmesg -C 2>/dev/null || true" >/dev/null
+  ok=0; rt_curl lan-client "http://$wan_host_ip:$wan_host_port/" | grep -q 'wan-host service' || ok=1
+  rt_verdict "with the logged forward rule, lan-client still reaches wan-host" "$ok"
+  body="$(rt_run router "sudo -n dmesg 2>/dev/null | grep 'tuilab-fwd ' | head -3")" || true
+  ok=1; grep -q 'tuilab-fwd ' <<<"$body" && ok=0
+  rt_verdict "the logged forward rule reaches the router's kernel log, what the live view reads" "$ok"
+  ok=1; grep -qE 'OUT=wan0' <<<"$body" && ok=0
+  rt_verdict "the logged kernel line shows the packet leaving on wan0" "$ok"
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+
   # The router is left as `up` handed it over: forwarding on, ruleset empty.
   rt_run router "sudo -n nft list ruleset" >/dev/null
 
@@ -2350,6 +2379,56 @@ cmd_router_test_via_tool() {
   # snapshot had are the forward rules the restore brought back.
   grep -q "iifname \"lan0\" oifname \"wan0\"" <<<"$presnap" || ok=1
   rt_verdict "the restored snapshot is the pre-apply ruleset, not an empty or half state" "$ok"
+
+  # -- per-rule logging and the live view, through the TUI (router item 10) --
+  # The form writes a forward rule, `l` marks it logged, `w` opens the live
+  # view. That view reads the kernel log — an nftables feature a real machine
+  # has and a rootless demo does not — so this leg is a lab-twin proof. The
+  # deterministic end-to-end evidence (a logged packet reaching the kernel log)
+  # is the direct phase's item-10 case; here we prove the two TUI surfaces.
+  tui_keys v; tui_pick "inet tui / forward" || true
+  tui_keys a
+  tui_wait_for "Add rule" 20 || true
+  tui_focus "Action" && tui_keys Enter && tui_pick "ALLOW"
+  tui_focus "In iface" && tui_type "lan0"
+  tui_focus "Out iface" && tui_type "wan0"
+  tui_focus "Comment" && tui_type "lab: logged forward"
+  tui_shot "log-rule-form"
+  tui_keys Enter
+  tui_confirm "log-rule-add"
+  # The just-added rule is selected; `l` toggles per-rule logging on it.
+  tui_keys l
+  tui_confirm "log-rule-toggle-on"
+  body="$(rtt_nft)" || true
+  ok=1; grep -qE "iifname \"lan0\" oifname \"wan0\".*log" <<<"$body" && ok=0
+  rt_verdict "the TUI's log toggle wrote a log statement onto the forward rule" "$ok"
+  # `w` opens the live firewall-log view. The footer is its stable marker; the
+  # status line ("live firewall log — …") is transient and an event overwrites
+  # it, so key off the footer the view always draws.
+  tui_keys w
+  ok=1; tui_wait_for "pause/resume" 15 && ok=0
+  tui_shot "live-view-open"
+  rt_verdict "the TUI opened the live firewall-log view" "$ok"
+
+  # The stream must stay attached to journald, not die on a bad invocation. A
+  # rootless demo cannot reach the kernel log, so this only means something on
+  # the lab twin: it is the real-machine regression guard for the live view's
+  # journalctl call. Give the process a moment to fail if it is going to.
+  sleep 2
+  pane="$(tui_pane)"
+  ok=0
+  grep -qE "the live log ended|exit status|unrecognized option" <<<"$pane" && ok=1
+  tui_shot "live-view-stream-health"
+  rt_verdict "the live firewall-log stream stayed healthy (journalctl attached, no error)" "$ok"
+
+  # Evidence only — whether an event lands in the pane depends on rule order in
+  # this chain, so it is a captured pane, not a verdict; the deterministic
+  # end-to-end proof (a logged packet reaching the kernel log) is the direct
+  # phase's item-10 case.
+  rt_run lan-client "for i in \$(seq 1 6); do curl -s -m2 http://$wan_host_ip:$wan_host_port/ >/dev/null 2>&1; sleep 0.3; done" >/dev/null 2>&1 &
+  sleep 3
+  tui_shot "live-view-after-traffic"
+  tui_keys q
 
   # -- done: leave the machine as `up` handed it over ----------------------
   tui_stop
