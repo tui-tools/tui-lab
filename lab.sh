@@ -1747,6 +1747,18 @@ tui_bin_path="/tmp/tui-firewall-drive"
 tui_shots=""
 tui_shot_n=0
 
+# tui_wait_ready waits for the tool to reach its LOADED first frame, not just
+# any frame. The footer hint "x actions" is drawn during the loading state too
+# (body: "reading the firewall…"), so waiting on it alone fires the first key
+# into the OSC-11/loading window, where the reader eats it. Wait for the
+# loading body to clear, then let the first real frame settle.
+tui_wait_ready() {
+  local limit="${1:-45}"
+  tui_wait_for "x actions" "$limit" || return 1
+  tui_wait_gone "reading the firewall" "$limit"
+  sleep 0.5
+}
+
 # tui_start launches the tool in a detached tmux session and waits for the
 # first drawn frame. The pane is 160x45: the confirm dialog holds a whole nft
 # command line and the evidence is worth nothing if the command is truncated.
@@ -1876,7 +1888,7 @@ tui_confirm() {
   tui_shot "$name-preview"
   pane="$(tui_pane)"
   tui_keys y
-  tui_wait_for "x actions" 30 || return 1
+  tui_wait_ready 30 || return 1
   # The status line says "running …" until the command comes back, and the
   # table behind it is only the new one after the reload that follows.
   tui_wait_gone "running " 60
@@ -1932,7 +1944,7 @@ cmd_router_test_via_tool() {
 
   local body ok
   tui_start router "TERM=xterm-256color $tui_bin_path --backend nftables"
-  tui_wait_for "x actions" 45 || { tui_stop; return 1; }
+  tui_wait_ready 45 || { tui_stop; return 1; }
   tui_shot "01-first-frame"
 
   # -- 1. the tool builds its own table ------------------------------------
@@ -2263,6 +2275,10 @@ cmd_router_test_via_tool() {
   tui_keys k
   tui_wait_gone "awaiting keep" 15
   tui_shot "staging-kept"
+  # Let the tool's own reload settle before the next scenario reads the model:
+  # a mutation triggers a background `nft` reload, and stepping on it while it
+  # runs is what makes the next frame briefly show a stale, empty model.
+  sleep 3
 
   # No half-applied state: the drop policy AND both accept rules are all there.
   body="$(rt_run router "sudo -n nft list chain inet tui forward")" || true
@@ -2281,6 +2297,7 @@ cmd_router_test_via_tool() {
   # apply is restored on its own — the connectivity-safe half of an OPNsense
   # apply. A visible probe rule is staged so the rollback has something to undo.
   tui_keys v; tui_pick "inet tui / input" || true
+  tui_keys R; tui_wait_for "inet tui" 15; sleep 2
   tui_keys s
   tui_wait_for "staging" 10
 
@@ -2291,6 +2308,10 @@ cmd_router_test_via_tool() {
   tui_focus "From" && tui_type "$wan_host_ip"
   tui_focus "Comment" && tui_type "lab: rollback probe"
   tui_keys Enter
+
+  # The pre-apply ruleset, captured here so the rollback can be checked against
+  # exactly what was on the machine the moment before the apply.
+  local presnap; presnap="$(rt_run router "sudo -n nft list ruleset")" || true
 
   tui_keys S
   tui_wait_for "Apply" 15
@@ -2316,13 +2337,18 @@ cmd_router_test_via_tool() {
   rt_verdict "with no keep in the window, the ruleset auto-rolled back to the snapshot" "$ok"
   tui_shot "rollback-restored"
 
-  # The snapshot restored is exactly the pre-apply ruleset: the kept batch from
-  # scenario 1 (forward policy drop and the accept rules) is still in place,
-  # so the rollback was a whole-ruleset restore, not a flush to empty.
-  body="$(rt_run router "sudo -n nft list chain inet tui forward")" || true
+  # The rollback is a whole-ruleset restore, not a flush to empty: the table and
+  # its pre-apply forward rules are back, and only the probe is gone. Compared
+  # against the snapshot captured just before the apply.
+  body="$(rt_run router "sudo -n nft list ruleset")" || true
   ok=1
-  grep -q "policy drop" <<<"$body" \
-    && grep -qE "iifname \"lan0\" oifname \"wan0\" .*accept" <<<"$body" && ok=0
+  if grep -q "table inet tui" <<<"$body" \
+    && grep -q "policy drop" <<<"$body" \
+    && grep -qE "iifname \"lan0\" oifname \"wan0\" .*accept" <<<"$body" \
+    && ! grep -q "lab: rollback probe" <<<"$body"; then ok=0; fi
+  # Corroborate against the captured pre-apply snapshot: the forward rules the
+  # snapshot had are the forward rules the restore brought back.
+  grep -q "iifname \"lan0\" oifname \"wan0\"" <<<"$presnap" || ok=1
   rt_verdict "the restored snapshot is the pre-apply ruleset, not an empty or half state" "$ok"
 
   # -- done: leave the machine as `up` handed it over ----------------------
