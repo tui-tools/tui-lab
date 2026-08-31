@@ -12,7 +12,7 @@
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
-#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic]
+#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic|--dhcp]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -1536,7 +1536,7 @@ rt_curl() { # rt_curl <vm> <url> — short timeout, so a dropped packet fails fa
 }
 
 cmd_router_test() {
-  local via_tool=0 traffic=0 bin=""
+  local via_tool=0 traffic=0 dhcp=0 bin=""
   while (($#)); do
     case "$1" in
       --via-tool)
@@ -1546,11 +1546,13 @@ cmd_router_test() {
         if [[ ${1:-} && ${1:0:1} != - ]]; then bin="$1"; shift; fi
         ;;
       --traffic) traffic=1; shift ;;
+      --dhcp) dhcp=1; shift ;;
       *) die "router test: unknown option: $1" ;;
     esac
   done
   if ((via_tool)); then cmd_router_test_via_tool "$bin"; return; fi
   if ((traffic)); then cmd_router_test_traffic; return; fi
+  if ((dhcp)); then cmd_router_test_dhcp; return; fi
 
   local role
   for role in router lan-client wan-host; do
@@ -2551,6 +2553,111 @@ print(0 if c.get("source")=="conntrack" and c.get("accounting")=="on" and c.get(
 
   echo
   if ((rt_rc)); then rt_say "VERDICT  router traffic on real interfaces: FAIL"; else rt_say "VERDICT  router traffic on real interfaces: PASS"; fi
+  log "evidence: $rt_log"
+  return $rt_rc
+}
+
+# ---------------------------------------------------------------------------
+# router test --dhcp: item 12, the router serves DHCP on the LAN, read on a VM
+# ---------------------------------------------------------------------------
+# The router runs dnsmasq on lan0; the LAN client asks for a lease over the wire
+# and gets one from the pool, and tui-network reads that lease back off the
+# running server. A real DHCP handshake between two VMs is something no rootless
+# demo can do, so this is a lab twin. dnsmasq is on the base image; SSH to the
+# guests is over the management NIC, so reconfiguring lan0 never cuts us off.
+cmd_router_test_dhcp() {
+  local role
+  for role in router lan-client wan-host; do
+    vm_running "$role" || die "$role is not running (lab.sh router up)"
+  done
+  need go python3
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-router-dhcp"
+  mkdir -p "$logdir"
+  rt_log="$logdir/dhcp.log"
+  rt_rc=0
+  local ok=""
+  { echo "### router serves DHCP on the LAN — $(date -Is)"; } >"$rt_log"
+
+  build_tool tui-network
+  local net_bin="$tool_bin"
+  log "shipping tui-network to the router"
+  vm_ssh router "rm -f /tmp/tui-network"
+  vm_scp router "$net_bin" "/tmp/tui-network" >/dev/null
+  vm_ssh router "chmod +x /tmp/tui-network"
+  rt_run router "/tmp/tui-network --version" >/dev/null
+
+  # The pool and the server config, written where tui-network manages its own:
+  # /etc/dnsmasq.d/tui-network.conf. port=0 keeps dnsmasq DHCP-only so it never
+  # fights systemd-resolved for port 53.
+  local pool_lo="10.91.0.100" pool_hi="10.91.0.150"
+  rt_run router "sudo -n tee /etc/dnsmasq.d/tui-network.conf >/dev/null <<'CONF'
+port=0
+interface=lan0
+bind-interfaces
+dhcp-range=$pool_lo,$pool_hi,255.255.255.0,1h
+dhcp-option=option:router,$router_lan_ip
+CONF
+sudo -n systemctl restart dnsmasq" >/dev/null
+  sleep 1
+  ok=1; rt_run router "systemctl is-active dnsmasq" | grep -q '^active' && ok=0
+  rt_verdict "the router's dnsmasq DHCP server is running on lan0" "$ok"
+
+  # The LAN client asks for a lease: a netplan drop-in turns dhcp4 on for lan0
+  # and networkd's own client does the handshake — no extra package.
+  rt_run lan-client "sudo -n tee /etc/netplan/99-tui-dhcp.yaml >/dev/null <<'NP'
+network:
+  version: 2
+  ethernets:
+    lan0:
+      dhcp4: true
+NP
+sudo -n chmod 600 /etc/netplan/99-tui-dhcp.yaml
+sudo -n netplan apply" >/dev/null 2>&1 || true
+
+  # Wait for the lease to land in the pool.
+  local leased=""
+  local i
+  for ((i = 0; i < 20; i++)); do
+    leased="$(rt_run lan-client "ip -4 -o addr show lan0 | grep -oE '10\.91\.0\.1[0-5][0-9]' | head -1" 2>/dev/null)"
+    [[ -n $leased ]] && break
+    sleep 1
+  done
+  { echo "lan-client lease: ${leased:-<none>}"; } >>"$rt_log"
+  ok=1; [[ -n $leased ]] && ok=0
+  rt_verdict "the LAN client got a DHCP lease from the router's pool ($pool_lo-$pool_hi)" "$ok"
+
+  # The router's own lease file records it.
+  local leasefile
+  leasefile="$(rt_run router "sudo -n cat /var/lib/misc/dnsmasq.leases 2>/dev/null")" || true
+  { echo "--- dnsmasq.leases ---"; printf '%s\n' "$leasefile" | sed 's/^/  /'; } >>"$rt_log"
+  ok=1; [[ -n $leased ]] && grep -q "$leased" <<<"$leasefile" && ok=0
+  rt_verdict "the router's dnsmasq lease file records the client's lease" "$ok"
+
+  # tui-network reads the running server back: active, one pool, one lease.
+  local check
+  check="$(rt_run router "sudo -n /tmp/tui-network --check 2>/dev/null")" || true
+  { echo "--- tui-network --check dhcp block ---"; printf '%s\n' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print(json.dumps(d.get("dhcp",{}), indent=2)[:800])
+except Exception as e:
+    print("parse fail:", e)' 2>/dev/null | sed 's/^/  /'; } >>"$rt_log"
+  ok="$(printf '%s' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+h=d.get("dhcp",{})
+print(0 if h.get("backend")=="dnsmasq" and h.get("active") and h.get("pools",0)>=1 and h.get("leases",0)>=1 else 1)' 2>/dev/null || echo 1)"
+  rt_verdict "tui-network reads the running DHCP server: active, one pool, the lease" "$ok"
+
+  # Restore the client to its static address and the router to nothing loaded.
+  rt_run lan-client "sudo -n rm -f /etc/netplan/99-tui-dhcp.yaml; sudo -n netplan apply" >/dev/null 2>&1 || true
+  rt_run router "sudo -n rm -f /etc/dnsmasq.d/tui-network.conf; sudo -n systemctl stop dnsmasq" >/dev/null 2>&1 || true
+
+  echo
+  if ((rt_rc)); then rt_say "VERDICT  router DHCP on the LAN: FAIL"; else rt_say "VERDICT  router DHCP on the LAN: PASS"; fi
   log "evidence: $rt_log"
   return $rt_rc
 }
