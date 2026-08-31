@@ -12,7 +12,7 @@
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
-#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]]
+#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -1536,7 +1536,7 @@ rt_curl() { # rt_curl <vm> <url> — short timeout, so a dropped packet fails fa
 }
 
 cmd_router_test() {
-  local via_tool=0 bin=""
+  local via_tool=0 traffic=0 bin=""
   while (($#)); do
     case "$1" in
       --via-tool)
@@ -1545,10 +1545,12 @@ cmd_router_test() {
         # sibling checkout, whatever branch it happens to be on.
         if [[ ${1:-} && ${1:0:1} != - ]]; then bin="$1"; shift; fi
         ;;
+      --traffic) traffic=1; shift ;;
       *) die "router test: unknown option: $1" ;;
     esac
   done
   if ((via_tool)); then cmd_router_test_via_tool "$bin"; return; fi
+  if ((traffic)); then cmd_router_test_traffic; return; fi
 
   local role
   for role in router lan-client wan-host; do
@@ -2442,6 +2444,114 @@ cmd_router_test_via_tool() {
   fi
   log "evidence: $rt_log"
   log "panes: $tui_shots"
+  return $rt_rc
+}
+
+# ---------------------------------------------------------------------------
+# router test --traffic: item 11, read the router's own traffic on real NICs
+# ---------------------------------------------------------------------------
+# tui-traffic reads /proc/net/dev for per-interface byte rates and conntrack for
+# the flows. Both are real-machine facts a rootless demo cannot produce, so this
+# is a lab twin: put real forwarded traffic through the router and read it back
+# with the tool's own --check JSON.
+cmd_router_test_traffic() {
+  local role
+  for role in router lan-client wan-host; do
+    vm_running "$role" || die "$role is not running (lab.sh router up)"
+  done
+  need go python3
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-router-traffic"
+  mkdir -p "$logdir"
+  rt_log="$logdir/traffic.log"
+  rt_rc=0
+  { echo "### router traffic on real interfaces — $(date -Is)"; } >"$rt_log"
+
+  build_tool tui-traffic
+  local traf_bin="$tool_bin"
+  log "shipping tui-traffic to the router"
+  vm_ssh router "rm -f /tmp/tui-traffic"
+  vm_scp router "$traf_bin" "/tmp/tui-traffic" >/dev/null
+  vm_ssh router "chmod +x /tmp/tui-traffic"
+  rt_run router "/tmp/tui-traffic --version" >/dev/null
+
+  # A working masquerade path, so lan->wan traffic is actually forwarded and
+  # both NICs carry it.
+  rt_nft "table ip lab {
+  chain nat_post {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname \"wan0\" ip saddr $router_lan_net counter masquerade
+  }
+  chain filter_fwd {
+    type filter hook forward priority filter; policy drop;
+    ct state established,related counter accept
+    iifname \"lan0\" oifname \"wan0\" counter accept
+  }
+}"
+  # tui-traffic reads flows from the conntrack table; without the conntrack
+  # userspace tool it falls back to the socket tables, which carry no bytes.
+  # Install it and turn on per-connection byte accounting (off by default) —
+  # both are the setup a router operator does to get per-flow byte stats, and
+  # what the tool's "byte accounting: off" header is telling you to do.
+  rt_run router "command -v conntrack >/dev/null 2>&1 || { sudo -n apt-get update -qq >/dev/null 2>&1; sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq conntrack >/dev/null 2>&1; }" >/dev/null || true
+  rt_run router "sudo -n sysctl -w net.netfilter.nf_conntrack_acct=1" >/dev/null
+
+  # Sustained lan->wan traffic for a fixed window, so both of --check's samples
+  # fall inside active traffic: a burst that finishes before the window reads as
+  # a zero rate. Start it, let it ramp, then sample over a 2s window.
+  rt_run lan-client "end=\$((SECONDS+16)); while [ \$SECONDS -lt \$end ]; do curl -s -m2 http://$wan_host_ip:$wan_host_port/ >/dev/null 2>&1; done" >/dev/null 2>&1 &
+  local loadpid=$!
+  sleep 3
+
+  local check ok
+  check="$(rt_run router "sudo -n /tmp/tui-traffic --check --interval 2s 2>/dev/null")" || true
+  {
+    echo "--- tui-traffic --check (truncated) ---"
+    printf '%s\n' "$check" | head -60 | sed 's/^/  /'
+  } >>"$rt_log"
+
+  ok=1
+  grep -q '"name": "wan0"' <<<"$check" && grep -q '"name": "lan0"' <<<"$check" && ok=0
+  rt_verdict "tui-traffic --check reports the router's wan0 and lan0 interfaces" "$ok"
+
+  ok="$(printf '%s' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+rates={x.get("name"):x.get("rxBytesPerSecond",0)+x.get("txBytesPerSecond",0) for x in d.get("interfaces",[])}
+print(0 if rates.get("wan0",0)>0 and rates.get("lan0",0)>0 else 1)' 2>/dev/null || echo 1)"
+  rt_verdict "tui-traffic measured nonzero byte rates on wan0 and lan0 under load" "$ok"
+
+  # The flow view needs a conntrack read path: the conntrack userspace tool or
+  # /proc/net/nf_conntrack. The kernel tracks the flows regardless, but this
+  # minimal cloud image ships neither reader unless conntrack-tools is present,
+  # and its apt install depends on the boot having had internet. When the path
+  # is here, prove the tool reads flows with byte accounting; when it is not,
+  # say so and stand on the interface-rate proof rather than failing on a
+  # provisioning gap the router profile — not the tool — should close.
+  local have_ct
+  have_ct="$(rt_run router "command -v conntrack >/dev/null 2>&1 && echo yes || { [ -r /proc/net/nf_conntrack ] && echo yes || echo no; }" 2>/dev/null)"
+  if [[ $have_ct == *yes* ]]; then
+    ok="$(printf '%s' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+c=d.get("connections",{})
+print(0 if c.get("source")=="conntrack" and c.get("accounting")=="on" and c.get("total",0)>0 else 1)' 2>/dev/null || echo 1)"
+    rt_verdict "tui-traffic reads the flows from conntrack with byte accounting on" "$ok"
+  else
+    rt_say "SKIP  no conntrack read path on this image (install conntrack-tools); the flow view falls back to socket counts. Interface-rate proof above stands."
+  fi
+
+  wait "$loadpid" 2>/dev/null || true
+  rt_run router "sudo -n nft flush ruleset" >/dev/null
+
+  echo
+  if ((rt_rc)); then rt_say "VERDICT  router traffic on real interfaces: FAIL"; else rt_say "VERDICT  router traffic on real interfaces: PASS"; fi
+  log "evidence: $rt_log"
   return $rt_rc
 }
 
