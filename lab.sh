@@ -12,7 +12,7 @@
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
-#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic|--dhcp|--vpn]
+#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic|--dhcp|--vpn|--gateways]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -70,6 +70,11 @@ libvirt_pool_path="${LAB_LIBVIRT_POOL_PATH:-$HOME/tuilab/images}"
 libvirt_mgmt_net="tuilab-mgmt"
 libvirt_wan_net="tuilab-wan"
 libvirt_lan_net="tuilab-lan"
+# A second, isolated WAN segment: a second uplink for the gateways/failover
+# proof (item 7). It carries an inert wan1 on the router and on the wan-host
+# (addresses only, no default route), so every other twin ignores it; the
+# gateways twin is the one that installs the two default routes.
+libvirt_wan2_net="tuilab-wan2"
 libvirt_mgmt_subnet="192.168.199"
 libvirt_base_vol="tuilab-base-noble.qcow2"
 
@@ -947,9 +952,12 @@ check_report() {
 
 router_wan_net="10.90.0.0/24"
 router_lan_net="10.91.0.0/24"
+router_wan2_net="10.92.0.0/24"
 router_wan_ip="10.90.0.1"
 router_lan_ip="10.91.0.1"
+router_wan2_ip="10.92.0.1"
 wan_host_ip="10.90.0.20"
+wan_host_wan2_ip="10.92.0.20"
 lan_client_ip="10.91.0.30"
 wan_host_port=8080
 lan_client_port=8081
@@ -994,6 +1002,12 @@ EOF
     set-name: lan0
     dhcp4: false
     addresses: [$router_lan_ip/24]
+  wan1:
+    match:
+      macaddress: "$(vm_mac "$name" 3)"
+    set-name: wan1
+    dhcp4: false
+    addresses: [$router_wan2_ip/24]
 EOF
       ;;
     wan-host)
@@ -1007,6 +1021,12 @@ EOF
     set-name: wan0
     dhcp4: false
     addresses: [$wan_host_ip/24]
+  wan1:
+    match:
+      macaddress: "$(vm_mac "$name" 2)"
+    set-name: wan1
+    dhcp4: false
+    addresses: [$wan_host_wan2_ip/24]
 EOF
       ;;
     lan-client)
@@ -1214,7 +1234,7 @@ EOF
   # no DHCP. That is what makes the NAT and forwarding checks mean something —
   # the only way between the segments is through the router.
   local seg name br sx
-  for seg in wan lan; do
+  for seg in wan lan wan2; do
     name="tuilab-$seg"; br="tuilab${seg}0"
     if ! lv net-info "$name" >/dev/null 2>&1; then
       log "defining isolated network $name"
@@ -1284,9 +1304,9 @@ libvirt_domain_xml() {
   local role="$1" mem="$2" cpus="$3" pool="$libvirt_pool_path" topo=""
   case "$role" in
     router)
-      topo="$(libvirt_iface "$libvirt_wan_net" "$(vm_mac router 1)")$(libvirt_iface "$libvirt_lan_net" "$(vm_mac router 2)")" ;;
+      topo="$(libvirt_iface "$libvirt_wan_net" "$(vm_mac router 1)")$(libvirt_iface "$libvirt_lan_net" "$(vm_mac router 2)")$(libvirt_iface "$libvirt_wan2_net" "$(vm_mac router 3)")" ;;
     wan-host)
-      topo="$(libvirt_iface "$libvirt_wan_net" "$(vm_mac wan-host 1)")" ;;
+      topo="$(libvirt_iface "$libvirt_wan_net" "$(vm_mac wan-host 1)")$(libvirt_iface "$libvirt_wan2_net" "$(vm_mac wan-host 2)")" ;;
     lan-client)
       topo="$(libvirt_iface "$libvirt_lan_net" "$(vm_mac lan-client 1)")" ;;
   esac
@@ -1340,7 +1360,11 @@ libvirt_boot_guest() {
   libvirt_ensure_infra
   local dir; dir="$(vm_dir "$role")"
   mkdir -p "$dir"
-  [[ -f $dir/seed.iso ]] || write_seed "$router_distro" "$role" "$dir" "$role"
+  # Always regenerate the seed: it is cheap, and a cached one goes stale the
+  # moment the network-config or user-data changes (a new NIC, a new address),
+  # which is a silent way to boot a guest with last run's topology.
+  rm -f "$dir/seed.iso"
+  write_seed "$router_distro" "$role" "$dir" "$role"
 
   if lv domstate "tuilab-$role" >/dev/null 2>&1; then
     lv undefine "tuilab-$role" >/dev/null 2>&1 || true
@@ -1374,7 +1398,7 @@ libvirt_router_teardown() {
     avell_ssh "rm -f '$pool/tuilab-$role.qcow2' '$pool/tuilab-$role-seed.iso' '$pool/tuilab-$role-serial.log'"
   done
   local net
-  for net in "$libvirt_wan_net" "$libvirt_lan_net" "$libvirt_mgmt_net"; do
+  for net in "$libvirt_wan_net" "$libvirt_wan2_net" "$libvirt_lan_net" "$libvirt_mgmt_net"; do
     if lv net-info "$net" >/dev/null 2>&1; then
       lv net-destroy "$net" >/dev/null 2>&1 || true
       lv net-undefine "$net" >/dev/null 2>&1 || true
@@ -1536,7 +1560,7 @@ rt_curl() { # rt_curl <vm> <url> — short timeout, so a dropped packet fails fa
 }
 
 cmd_router_test() {
-  local via_tool=0 traffic=0 dhcp=0 vpn=0 bin=""
+  local via_tool=0 traffic=0 dhcp=0 vpn=0 gateways=0 bin=""
   while (($#)); do
     case "$1" in
       --via-tool)
@@ -1548,6 +1572,7 @@ cmd_router_test() {
       --traffic) traffic=1; shift ;;
       --dhcp) dhcp=1; shift ;;
       --vpn) vpn=1; shift ;;
+      --gateways) gateways=1; shift ;;
       *) die "router test: unknown option: $1" ;;
     esac
   done
@@ -1555,6 +1580,7 @@ cmd_router_test() {
   if ((traffic)); then cmd_router_test_traffic; return; fi
   if ((dhcp)); then cmd_router_test_dhcp; return; fi
   if ((vpn)); then cmd_router_test_vpn; return; fi
+  if ((gateways)); then cmd_router_test_gateways; return; fi
 
   local role
   for role in router lan-client wan-host; do
@@ -2774,6 +2800,109 @@ print(0 if w.get("available") and ifaces else 1)' 2>/dev/null || echo 1)"
 
   echo
   if ((rt_rc)); then rt_say "VERDICT  router WireGuard tunnel: FAIL"; else rt_say "VERDICT  router WireGuard tunnel: PASS"; fi
+  log "evidence: $rt_log"
+  return $rt_rc
+}
+
+# ---------------------------------------------------------------------------
+# router test --gateways: item 7, two uplinks and a real failover
+# ---------------------------------------------------------------------------
+# The router has two WAN uplinks (wan0 and wan1, each with the dual-homed
+# wan-host as its gateway). It installs a default route through each; tui-network
+# sees both and which one is active, and when the primary link drops the kernel
+# fails over to the secondary — which tui-network then reads as the new active
+# uplink. A real two-path failover is a routing fact of a live machine, so this
+# is a lab twin. It needs the second WAN segment, so it is libvirt only.
+cmd_router_test_gateways() {
+  [[ $lab_backend == libvirt ]] || die "the gateways twin needs the second WAN segment: run with --backend libvirt"
+  local role
+  for role in router lan-client wan-host; do
+    vm_running "$role" || die "$role is not running (lab.sh router up)"
+  done
+  need go python3
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-router-gateways"
+  mkdir -p "$logdir"
+  rt_log="$logdir/gateways.log"
+  rt_rc=0
+  local ok=""
+  { echo "### router uplinks and failover — $(date -Is)"; } >"$rt_log"
+
+  build_tool tui-network
+  local net_bin="$tool_bin"
+  log "shipping tui-network to the router"
+  vm_ssh router "rm -f /tmp/tui-network"
+  vm_scp router "$net_bin" "/tmp/tui-network" >/dev/null
+  vm_ssh router "chmod +x /tmp/tui-network"
+
+  local gw_a="$wan_host_ip" gw_b="$wan_host_wan2_ip"
+
+  # Both uplinks reach their gateway (the dual-homed wan-host) before we route.
+  ok=0; rt_run router "ping -c2 -W2 $gw_a >/dev/null && ping -c2 -W2 $gw_b >/dev/null" >/dev/null || ok=1
+  rt_verdict "both uplink gateways answer: wan0->$gw_a and wan1->$gw_b" "$ok"
+
+  # A default route through each uplink. wan0 is the primary (lower metric).
+  rt_run router "sudo -n ip route replace default via $gw_a dev wan0 metric 50
+sudo -n ip route replace default via $gw_b dev wan1 metric 60" >/dev/null
+
+  local check
+  check="$(rt_run router "sudo -n /tmp/tui-network --check 2>/dev/null")" || true
+  { echo "--- tui-network --check gateways block ---"; printf '%s\n' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print(json.dumps(d.get("gateways",{}), indent=2)[:1000])
+except Exception as e:
+    print("parse fail:", e)' 2>/dev/null | sed 's/^/  /'; } >>"$rt_log"
+
+  ok="$(printf '%s' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+g=d.get("gateways",{})
+print(0 if g.get("count",0)>=2 and g.get("multipleUplinks") else 1)' 2>/dev/null || echo 1)"
+  rt_verdict "tui-network sees more than one uplink (the failover precondition)" "$ok"
+
+  # The kernel routes through the primary, and tui-network flags it active.
+  local egress
+  egress="$(rt_run router "ip -o route get 8.8.8.8 2>/dev/null")" || true
+  { echo "before failover: $egress"; } >>"$rt_log"
+  ok=1; grep -q 'dev wan0' <<<"$egress" && ok=0
+  rt_verdict "the kernel's active uplink is the primary (wan0)" "$ok"
+
+  ok="$(GWA="$gw_a" python3 -c 'import sys,json,os
+gw=os.environ["GWA"]
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+print(0 if [g for g in d.get("gateways",{}).get("list",[]) if g.get("Address")==gw and g.get("Active")] else 1)' <<<"$check" 2>/dev/null || echo 1)"
+  rt_verdict "tui-network flags the primary uplink ($gw_a) as active" "$ok"
+
+  # Pull the primary link down: the kernel drops its default and fails over.
+  rt_run router "sudo -n ip link set wan0 down" >/dev/null
+  sleep 2
+  egress="$(rt_run router "ip -o route get 8.8.8.8 2>/dev/null")" || true
+  { echo "after wan0 down: $egress"; } >>"$rt_log"
+  ok=1; grep -q 'dev wan1' <<<"$egress" && ok=0
+  rt_verdict "with the primary down, the kernel fails over to the secondary (wan1)" "$ok"
+
+  local check2
+  check2="$(rt_run router "sudo -n /tmp/tui-network --check 2>/dev/null")" || true
+  ok="$(GWB="$gw_b" python3 -c 'import sys,json,os
+gw=os.environ["GWB"]
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+print(0 if [g for g in d.get("gateways",{}).get("list",[]) if g.get("Address")==gw and g.get("Active")] else 1)' <<<"$check2" 2>/dev/null || echo 1)"
+  rt_verdict "tui-network now flags the secondary uplink ($gw_b) as active" "$ok"
+
+  # Restore: primary back up, remove the test's default routes.
+  rt_run router "sudo -n ip link set wan0 up; sudo -n ip route del default via $gw_a dev wan0 metric 50 2>/dev/null || true; sudo -n ip route del default via $gw_b dev wan1 metric 60 2>/dev/null || true; sudo -n netplan apply" >/dev/null 2>&1 || true
+
+  echo
+  if ((rt_rc)); then rt_say "VERDICT  router uplinks and failover: FAIL"; else rt_say "VERDICT  router uplinks and failover: PASS"; fi
   log "evidence: $rt_log"
   return $rt_rc
 }
