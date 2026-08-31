@@ -12,7 +12,7 @@
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
-#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic|--dhcp]
+#   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic|--dhcp|--vpn]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -1536,7 +1536,7 @@ rt_curl() { # rt_curl <vm> <url> — short timeout, so a dropped packet fails fa
 }
 
 cmd_router_test() {
-  local via_tool=0 traffic=0 dhcp=0 bin=""
+  local via_tool=0 traffic=0 dhcp=0 vpn=0 bin=""
   while (($#)); do
     case "$1" in
       --via-tool)
@@ -1547,12 +1547,14 @@ cmd_router_test() {
         ;;
       --traffic) traffic=1; shift ;;
       --dhcp) dhcp=1; shift ;;
+      --vpn) vpn=1; shift ;;
       *) die "router test: unknown option: $1" ;;
     esac
   done
   if ((via_tool)); then cmd_router_test_via_tool "$bin"; return; fi
   if ((traffic)); then cmd_router_test_traffic; return; fi
   if ((dhcp)); then cmd_router_test_dhcp; return; fi
+  if ((vpn)); then cmd_router_test_vpn; return; fi
 
   local role
   for role in router lan-client wan-host; do
@@ -2658,6 +2660,120 @@ print(0 if h.get("backend")=="dnsmasq" and h.get("active") and h.get("pools",0)>
 
   echo
   if ((rt_rc)); then rt_say "VERDICT  router DHCP on the LAN: FAIL"; else rt_say "VERDICT  router DHCP on the LAN: PASS"; fi
+  log "evidence: $rt_log"
+  return $rt_rc
+}
+
+# ---------------------------------------------------------------------------
+# router test --vpn: item 8, a real WireGuard tunnel the router terminates
+# ---------------------------------------------------------------------------
+# The router and the wan-host bring up a WireGuard tunnel over the WAN segment,
+# exchange a handshake, and pass traffic inside it; then tui-vpn reads the live
+# interface and its peer back. A real encrypted handshake between two machines
+# is not something a rootless demo can do, so this is a lab twin. wireguard-tools
+# is on the base image. Headscale coordination and the OIDC path (item 9) are
+# out of scope here — this proves the WireGuard leg (item 8).
+cmd_router_test_vpn() {
+  local role
+  for role in router lan-client wan-host; do
+    vm_running "$role" || die "$role is not running (lab.sh router up)"
+  done
+  need go python3
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-router-vpn"
+  mkdir -p "$logdir"
+  rt_log="$logdir/vpn.log"
+  rt_rc=0
+  local ok=""
+  { echo "### router terminates a WireGuard tunnel — $(date -Is)"; } >"$rt_log"
+
+  build_tool tui-vpn
+  local vpn_bin="$tool_bin"
+  log "shipping tui-vpn to the router"
+  vm_ssh router "rm -f /tmp/tui-vpn"
+  vm_scp router "$vpn_bin" "/tmp/tui-vpn" >/dev/null
+  vm_ssh router "chmod +x /tmp/tui-vpn"
+  rt_run router "/tmp/tui-vpn --version" >/dev/null
+
+  # Keys, generated on each host so no private key ever crosses the wire.
+  rt_run router "umask 077; wg genkey | sudo -n tee /etc/wireguard/wg.key >/dev/null; sudo -n sh -c 'wg pubkey < /etc/wireguard/wg.key > /etc/wireguard/wg.pub'" >/dev/null
+  rt_run wan-host "umask 077; wg genkey | sudo -n tee /etc/wireguard/wg.key >/dev/null; sudo -n sh -c 'wg pubkey < /etc/wireguard/wg.key > /etc/wireguard/wg.pub'" >/dev/null
+  local router_pub wanhost_pub router_priv wanhost_priv
+  router_pub="$(rt_run router "sudo -n cat /etc/wireguard/wg.pub")"
+  wanhost_pub="$(rt_run wan-host "sudo -n cat /etc/wireguard/wg.pub")"
+  router_priv="$(rt_run router "sudo -n cat /etc/wireguard/wg.key")"
+  wanhost_priv="$(rt_run wan-host "sudo -n cat /etc/wireguard/wg.key")"
+
+  # The router listens on its WAN address; the wan-host dials it. The tunnel is
+  # 10.99.0.0/24, off every other network in the lab.
+  rt_run router "sudo -n tee /etc/wireguard/wg0.conf >/dev/null <<CONF
+[Interface]
+Address = 10.99.0.1/24
+ListenPort = 51820
+PrivateKey = $router_priv
+
+[Peer]
+PublicKey = $wanhost_pub
+AllowedIPs = 10.99.0.2/32
+CONF
+sudo -n chmod 600 /etc/wireguard/wg0.conf
+sudo -n wg-quick up wg0" >/dev/null 2>&1 || true
+
+  rt_run wan-host "sudo -n tee /etc/wireguard/wg0.conf >/dev/null <<CONF
+[Interface]
+Address = 10.99.0.2/24
+PrivateKey = $wanhost_priv
+
+[Peer]
+PublicKey = $router_pub
+Endpoint = $router_wan_ip:51820
+AllowedIPs = 10.99.0.1/32
+PersistentKeepalive = 15
+CONF
+sudo -n chmod 600 /etc/wireguard/wg0.conf
+sudo -n wg-quick up wg0" >/dev/null 2>&1 || true
+  sleep 2
+
+  ok=1; rt_run router "sudo -n wg show wg0 >/dev/null 2>&1 && echo up" | grep -q up && ok=0
+  rt_verdict "the router brought up the WireGuard interface wg0" "$ok"
+
+  # Traffic inside the tunnel: the wan-host reaches the router's tunnel address,
+  # which only works once the handshake has happened.
+  ok=1; rt_run wan-host "ping -c2 -W3 10.99.0.1 >/dev/null 2>&1 && echo ok" | grep -q ok && ok=0
+  rt_verdict "traffic flows inside the tunnel (wan-host reaches the router at 10.99.0.1)" "$ok"
+
+  # The handshake is recorded against the peer.
+  local hs
+  hs="$(rt_run router "sudo -n wg show wg0 latest-handshakes")" || true
+  { echo "--- wg show latest-handshakes ---"; printf '%s\n' "$hs" | sed 's/^/  /'; } >>"$rt_log"
+  ok=1; [[ -n $hs ]] && awk '{ if ($2+0 > 0) found=1 } END { exit found?0:1 }' <<<"$hs" && ok=0
+  rt_verdict "the router recorded a handshake with the peer" "$ok"
+
+  # tui-vpn reads the live interface and its peer back.
+  local check
+  check="$(rt_run router "sudo -n /tmp/tui-vpn --check 2>/dev/null")" || true
+  { echo "--- tui-vpn --check wireguard block ---"; printf '%s\n' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print(json.dumps(d.get("wireguard",{}), indent=2)[:900])
+except Exception as e:
+    print("parse fail:", e)' 2>/dev/null | sed 's/^/  /'; } >>"$rt_log"
+  ok="$(printf '%s' "$check" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+w=d.get("wireguard",{})
+ifaces=[i for i in w.get("interfaces",[]) if i.get("up") and i.get("peerCount",0)>=1]
+print(0 if w.get("available") and ifaces else 1)' 2>/dev/null || echo 1)"
+  rt_verdict "tui-vpn reads the live tunnel: wireguard available, wg0 up with a peer" "$ok"
+
+  # Tear the tunnel down and remove its keys and config on both hosts.
+  rt_run router "sudo -n wg-quick down wg0 >/dev/null 2>&1; sudo -n rm -f /etc/wireguard/wg0.conf /etc/wireguard/wg.key /etc/wireguard/wg.pub" >/dev/null 2>&1 || true
+  rt_run wan-host "sudo -n wg-quick down wg0 >/dev/null 2>&1; sudo -n rm -f /etc/wireguard/wg0.conf /etc/wireguard/wg.key /etc/wireguard/wg.pub" >/dev/null 2>&1 || true
+
+  echo
+  if ((rt_rc)); then rt_say "VERDICT  router WireGuard tunnel: FAIL"; else rt_say "VERDICT  router WireGuard tunnel: PASS"; fi
   log "evidence: $rt_log"
   return $rt_rc
 }
