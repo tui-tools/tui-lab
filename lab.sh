@@ -335,7 +335,9 @@ cmd_images() {
 #            Cloud is enforcing out of the box; policycoreutils so the SELinux
 #            state is inspectable; cronie, so that one machine in the lab is a
 #            `crond.service` machine — the other half of tui-cron's unit-name
-#            detection, which nothing here exercised before.
+#            detection, which nothing here exercised before; samba plus
+#            samba-tools, without the two AD DC packages, so the guest is the
+#            half-installed machine tui-dc has to refuse to provision on.
 #   omarchy  nothing. The image ships the server profile's firewall already,
 #            and installing into it would stop testing the shipped machine.
 #
@@ -413,6 +415,25 @@ packages:
   # covered only by fixtures. cronie is Fedora's cron, and it brings
   # /etc/cron.d/0hourly and /etc/crontab with it.
   - cronie
+  # Fedora Cloud Base Generic ships no samba at all, so without these the lab
+  # has no machine where `samba-tool` exists and tui-dc has nowhere to run.
+  # On Fedora the pieces are split three ways: `samba-tool` comes from
+  # samba-tools, the AD schema files under /usr/share/samba/setup/ad-schema/
+  # come from samba-dc-provision, and the AD DC daemon (samba.service) comes
+  # from samba-dc. samba-dc and samba-dc-provision are left out on purpose: a
+  # host with samba and samba-tools and neither of those is exactly the state
+  # a user is in after installing samba and trying to provision a domain, and
+  # it is the state where `samba-tool domain provision` fails late with a
+  # Python traceback about a missing schema file. Keeping the guest in it is
+  # what lets the lab test that a tool says so before it tries.
+  # `samba` also brings /etc/samba/smb.conf with `security = user`, which
+  # resolves to `server role = auto` — the second thing that makes
+  # `samba-tool domain provision` refuse. Having that file exactly as the
+  # distro ships it is part of the fixture, not an accident.
+  # No samba unit is enabled either: this guest is not a file server, and a
+  # daemon that is installed but stopped is the machine under test.
+  - samba
+  - samba-tools
 runcmd:
   - [bash, -c, "systemctl enable --now firewalld"]
   # cronie's unit is not enabled by the package, and a cron daemon that is
