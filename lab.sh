@@ -13,6 +13,7 @@
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
 #   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic|--dhcp|--vpn|--gateways]
+#   lab.sh dc test [vm] [--bin PATH]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -237,6 +238,25 @@ vm_scp() {
 # The poll interval is 10s, not 5s, for the same `ufw limit` reason as above: a
 # 5s poll sits exactly on the rate limiter's threshold and would lock itself out
 # just as the machine became reachable.
+# vm_install installs packages in a guest with whatever package manager that
+# guest has. The lab runs three distributions, so a driver that needs something
+# in the guest — tmux for the TUI flows, a DNS client for the DC flow — cannot
+# name apt-get and be done with it.
+vm_install() {
+  local name="$1"; shift
+  vm_ssh "$name" "set -e
+    if command -v dnf >/dev/null; then
+      sudo -n dnf -y -q install $*
+    elif command -v apt-get >/dev/null; then
+      sudo -n apt-get update -qq
+      sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $*
+    elif command -v pacman >/dev/null; then
+      sudo -n pacman -Sy --noconfirm --needed $*
+    else
+      echo 'no package manager this lab knows' >&2; exit 1
+    fi" >/dev/null 2>&1
+}
+
 vm_wait_ssh() {
   local name="$1" limit="${2:-600}" i
   local opts; mapfile -t opts < <(ssh_opts "$name")
@@ -1828,6 +1848,12 @@ tui_session="tui-drive"
 tui_bin_path="/tmp/tui-firewall-drive"
 tui_shots=""
 tui_shot_n=0
+# tui_secret is one string that must never reach a file or a log: the DC flow
+# sets it to the Administrator password samba-tool prints once, because from
+# that screen on every capture of the result screen carries it. It is scrubbed
+# at the one place every capture comes through, so no later caller can leak it
+# by forgetting.
+tui_secret=""
 
 # tui_wait_ready waits for the tool to reach its LOADED first frame, not just
 # any frame. The footer hint "x actions" is drawn during the loading state too
@@ -1847,7 +1873,10 @@ tui_wait_ready() {
 tui_start() {
   tui_vm="$1"; shift
   local cmd="$*"
-  vm_ssh "$tui_vm" "command -v tmux >/dev/null 2>&1 || { sudo -n apt-get update -qq >/dev/null 2>&1; sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux >/dev/null 2>&1; }"
+  # Through vm_install rather than apt-get: the driver runs on Fedora guests too,
+  # and on one of those an apt-get line installs nothing and fails one line later
+  # with a message about tmux instead of about the package manager.
+  vm_ssh "$tui_vm" "command -v tmux >/dev/null" 2>/dev/null || vm_install "$tui_vm" tmux || true
   vm_ssh "$tui_vm" "command -v tmux >/dev/null" || die "tmux could not be installed on $tui_vm"
   vm_ssh "$tui_vm" "sudo -n loginctl enable-linger $lab_user >/dev/null 2>&1 || true"
   vm_ssh "$tui_vm" "tmux kill-session -t $tui_session 2>/dev/null; sleep 1; tmux new-session -d -s $tui_session -x 160 -y 45 '$cmd'; sleep 1; tmux ls" >/dev/null \
@@ -1861,9 +1890,18 @@ tui_stop() {
   vm_ssh "$tui_vm" "tmux send-keys -t $tui_session q 2>/dev/null; sleep 1; tmux kill-session -t $tui_session 2>/dev/null; true" >/dev/null 2>&1 || true
 }
 
-# tui_pane returns what is on the screen right now, as plain text.
+# tui_pane returns what is on the screen right now, as plain text — with
+# tui_secret taken out of it when one is set. Python does the replacement
+# because a password is arbitrary punctuation and a sed expression built from it
+# would be a shell quoting accident waiting to happen.
 tui_pane() {
-  vm_ssh "$tui_vm" "tmux capture-pane -p -t $tui_session" 2>/dev/null
+  local raw
+  raw="$(vm_ssh "$tui_vm" "tmux capture-pane -p -t $tui_session" 2>/dev/null)"
+  if [[ -n $tui_secret ]]; then
+    raw="$(TUI_SECRET="$tui_secret" python3 -c 'import os, sys
+sys.stdout.write(sys.stdin.read().replace(os.environ["TUI_SECRET"], "<password-redacted>"))' <<<"$raw")"
+  fi
+  printf '%s\n' "$raw"
 }
 
 # tui_shot records the screen as a numbered file under the evidence directory
@@ -2950,6 +2988,468 @@ cmd_router() {
 }
 
 # ---------------------------------------------------------------------------
+# dc test: the provision wizard, driven end to end on a real Fedora guest
+# ---------------------------------------------------------------------------
+# Creating a domain is the one flow in this family that cannot be proved
+# anywhere but on a real machine. What the wizard builds is a `samba-tool domain
+# provision`, and everything that decides whether the controller it creates can
+# actually serve the domain is a fact about that machine: the distribution's own
+# smb.conf standing in the way, the AD schema package that is not installed,
+# which of the host's addresses lands in the DC's own A record, whether the
+# internal DNS server can bind port 53, whether the MIT KDC finds a realm. A
+# fake backend can render every one of those screens and prove none of them.
+#
+# So this is the router flow's method pointed at one guest: tmux drives the real
+# TUI, every confirm dialog is captured before the key that accepts it, and
+# every assertion is made against the guest itself rather than against the
+# screen that claimed it.
+#
+# Two things the run does to the guest, both on purpose:
+#
+#   * It installs samba-dc-provision and samba-dc itself, outside the tool. The
+#     seed deliberately ships samba and samba-tools and nothing more, because
+#     "samba-tool is here and the AD schema is not" is the state one of the
+#     preflight's two conditions exists for. Installing packages is not the
+#     tool's job, and this run is where that is proved: the tool names the
+#     packages, the lab installs them.
+#   * It gives the guest a second address and something holding DNS on it (see
+#     dc_fixture_up). Half of what this flow proves only exists on a multi-homed
+#     host.
+#
+# The guest is left provisioned, and a provision is not idempotent, so a second
+# run starts from the snapshot this one expects:
+#
+#   ./lab.sh down fedora && ./lab.sh restore fedora pre-dc && ./lab.sh up fedora --mem 4096
+
+# The realm is a documentation name and the addresses are the lab's own: the
+# guest's qemu user-mode address, that network's DNS forwarder, and the fixture
+# address below.
+dc_realm="lab.example"
+dc_netbios="LAB"
+dc_forwarder="10.0.2.3"
+dc_guest_ip="10.0.2.15"
+dc_unit="samba.service"
+
+# The fixture: a dummy interface with an address of its own, and a process
+# sitting on port 53 there.
+dc_fixture_if="labdummy0"
+dc_fixture_ip="10.90.0.1"
+dc_fixture_unit="lab-dns-hold"
+
+# Where the binary under test lands in the guest. Its own path, not
+# /tmp/tui-dc: `lab.sh test tui-dc` ships one there and a running binary cannot
+# be overwritten in place.
+dc_bin_path="/tmp/tui-dc-drive"
+
+# dc_norm flattens a captured pane into one line of single-spaced text. The
+# confirm dialog wraps a long command line with an indented continuation, so an
+# option like '--option=bind interfaces only=yes' is split across two lines on a
+# 160-column pane: asserting on the raw screen would be asserting on the
+# terminal's width rather than on the command.
+dc_norm() { printf '%s' "$1" | sed 's/│/ /g' | tr '\n' ' ' | tr -s ' '; }
+
+# dc_screen is the current screen, flattened — and never the reason a run stops.
+# A capture is one ssh round trip, so one lost round trip should fail the
+# assertion that reads the screen and say so in the table, not kill the driver
+# twenty minutes into a provision it cannot repeat.
+dc_screen() {
+  local pane=""
+  pane="$(tui_pane)" || pane=""
+  dc_norm "$pane"
+}
+
+# dc_has and dc_lacks assert over a flattened screen and name what they proved
+# either way, so the table reads as findings rather than as string matches.
+dc_has() {
+  local text="$1" needle="$2" label="$3" ok=1
+  [[ $text == *"$needle"* ]] && ok=0
+  rt_verdict "$label" "$ok"
+}
+
+dc_lacks() {
+  local text="$1" needle="$2" label="$3" ok=0
+  [[ $text == *"$needle"* ]] && ok=1
+  rt_verdict "$label" "$ok"
+}
+
+# dc_json reads one fact out of the tool's own --check JSON. The expression is
+# python over the decoded document, so each assertion below reads as the fact it
+# proves instead of as a grep over a JSON blob.
+dc_json() {
+  local json="$1" expression="$2"
+  DC_EXPR="$expression" python3 -c 'import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(1); sys.exit()
+print(0 if eval(os.environ["DC_EXPR"], {"d": d}) else 1)' <<<"$json" 2>/dev/null || echo 1
+}
+
+# dc_ready waits for the browse screen to be loaded, not merely drawn. The
+# footer is there during the first read too, and P pressed in that window is
+# answered from an empty model — the tool says this host already serves a domain
+# and the run would fail on a race. The "press P" fact row is only on a loaded
+# screen that found samba-tool and no domain, which is exactly this guest.
+dc_ready() {
+  tui_wait_for "press P to provision" "${1:-60}" || return 1
+  sleep 0.5
+}
+
+# dc_confirm captures the open confirm dialog, accepts it and waits for whatever
+# screen follows. The capture comes first, always: the preview is the evidence,
+# and a dialog accepted before it was recorded proves nothing.
+dc_confirm() {
+  local name="$1" after="$2" limit="${3:-60}"
+  tui_wait_for "Command to run:" 20 || return 1
+  tui_shot "$name-preview"
+  tui_keys y
+  tui_wait_for "$after" "$limit" || return 1
+  tui_shot "$name-after"
+}
+
+# dc_fixture_up makes the guest multi-homed and puts something on port 53 of the
+# new address.
+#
+# Both halves are load-bearing. The wizard skips its address question entirely
+# on a host with one address, so a single-homed guest cannot prove that the
+# picker offers this host's addresses, that the default-route one is
+# preselected, or that the answer becomes --host-ip. And `bind interfaces only`
+# is indistinguishable from not setting it until something else already holds
+# port 53 on an address the controller would otherwise have claimed — which is
+# the shape of every host running libvirt or docker, and the reason a
+# provisioned DC there never starts.
+dc_fixture_up() {
+  local vm="$1" hold body
+  # A DNS client for the zone assertions at the end of the run. It belongs to
+  # the lab, not to the tool, so it goes in with the fixture.
+  vm_install "$vm" bind-utils || true
+  rt_run "$vm" "sudo -n modprobe dummy 2>/dev/null || true
+    sudo -n ip link add $dc_fixture_if type dummy 2>/dev/null || true
+    sudo -n ip addr replace $dc_fixture_ip/24 dev $dc_fixture_if
+    sudo -n ip link set $dc_fixture_if up" >/dev/null || true
+
+  # A few lines of python holding the socket and answering nothing — holding it
+  # is the whole point. Under a transient unit so it outlives this ssh session
+  # and can be stopped by name rather than hunted for by pid.
+  hold="python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('$dc_fixture_ip',53));exec('while 1: s.recvfrom(512)')\""
+  rt_run "$vm" "sudo -n systemctl stop $dc_fixture_unit 2>/dev/null || true
+    sudo -n systemd-run --unit=$dc_fixture_unit --collect $hold" >/dev/null || true
+  sleep 2
+
+  body="$(rt_run "$vm" "ip -4 -o addr")" || true
+  dc_has "$body" "$dc_fixture_ip" \
+    "the guest has a second address ($dc_fixture_ip): the wizard has something to ask about"
+  body="$(rt_run "$vm" "sudo -n ss -ulnp")" || true
+  dc_has "$body" "$dc_fixture_ip:53" \
+    "something already holds DNS on $dc_fixture_ip:53 — what bind interfaces only has to avoid"
+}
+
+# dc_fixture_down leaves the guest's network the way the run found it. The
+# provisioned domain stays; the fixture does not, because it is the lab's and
+# not the domain's.
+dc_fixture_down() {
+  local vm="$1"
+  rt_run "$vm" "sudo -n systemctl stop $dc_fixture_unit 2>/dev/null || true
+    sudo -n ip link del $dc_fixture_if 2>/dev/null || true" >/dev/null 2>&1 || true
+}
+
+cmd_dc_test() {
+  local vm="" bin=""
+  while (($#)); do
+    case "$1" in
+      --bin) bin="${2:?--bin needs a path}"; shift 2 ;;
+      -*) die "dc test: unknown option: $1" ;;
+      *) vm="$1"; shift ;;
+    esac
+  done
+  vm="${vm:-fedora}"
+  need python3
+  vm_running "$vm" || die "$vm is not running (lab.sh up $vm --mem 4096)"
+
+  build_tool tui-dc "$bin"
+  bin="$tool_bin"
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-dc"
+  tui_shots="$logdir/panes"
+  mkdir -p "$tui_shots"
+  rt_log="$logdir/dc.log"
+  rt_rc=0
+  tui_secret=""
+  tui_shot_n=0
+  tui_session="tui-dc-drive"
+
+  local iface name check body preview password ok
+  iface="$(rt_run "$vm" "ip -o -4 route show default | awk '{print \$5; exit}'")" || true
+  iface="${iface//[[:space:]]/}"
+  name="$(rt_run "$vm" "hostname -s")" || true
+  name="$(printf '%s' "${name//[[:space:]]/}" | tr '[:upper:]' '[:lower:]')"
+  local dc_name="$name.$dc_realm"
+  {
+    echo "### the provision wizard on $vm, driven through tui-dc — $(date -Is)"
+    echo "guest: $dc_guest_ip on $iface, forwarder $dc_forwarder"
+    echo "fixture: $dc_fixture_ip on $dc_fixture_if, with a process on its port 53"
+    echo "realm: $dc_realm, controller: $dc_name"
+    echo "binary: $bin"
+  } >"$rt_log"
+  [[ -n $iface ]] || die "could not read the guest's default-route interface"
+
+  # -- 1. a multi-homed guest, before the tool is started -------------------
+  log "making $vm multi-homed, with DNS already held on $dc_fixture_ip"
+  dc_fixture_up "$vm"
+
+  log "shipping $bin to $vm"
+  vm_ssh "$vm" "rm -f $dc_bin_path"
+  vm_scp "$vm" "$bin" "$dc_bin_path" >/dev/null
+  vm_ssh "$vm" "chmod +x $dc_bin_path"
+  rt_run "$vm" "$dc_bin_path --version" >/dev/null
+
+  # -- 2. the preflight names both refusals --------------------------------
+  # Both used to be discovered after the realm had been typed twice and the
+  # command confirmed, one of them a minute into a provision that then died in a
+  # Python traceback. So the first thing to prove is that neither costs a wizard
+  # run any more.
+  tui_start "$vm" "TERM=xterm-256color $dc_bin_path"
+  dc_ready 90 || { tui_stop; return 1; }
+  tui_shot "first-frame"
+  tui_keys P
+  tui_wait_for "Provisioning cannot start" 20 || { tui_stop; return 1; }
+  tui_shot "preflight-both-conditions"
+  body="$(dc_screen)"
+  dc_has "$body" "/etc/samba/smb.conf configures this host as" \
+    "the preflight names the distribution's smb.conf standing in the way"
+  dc_has "$body" "provision will not start beside it" \
+    "it says why: provision refuses unless the resolved server role is the DC one"
+  dc_has "$body" "the AD provisioning data is not installed" \
+    "the preflight names the missing AD provisioning data"
+  dc_has "$body" "samba-dc-provision" \
+    "and the Fedora package that carries it, samba-dc-provision"
+  dc_lacks "$body" "Provision 1/6" \
+    "the preflight stopped the wizard before its first question"
+
+  # -- 3. the offered fix runs ---------------------------------------------
+  # The one condition the tool can clear, cleared through the tool's own
+  # previewed confirm rather than in a shell.
+  tui_keys Enter
+  tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
+  preview="$(dc_screen)"
+  dc_has "$preview" "mv /etc/samba/smb.conf /etc/samba/smb.conf.orig" \
+    "the fix it offers is the previewed mv of the distribution's smb.conf"
+  dc_confirm "smbconf-move" "done: Move /etc/samba/smb.conf aside" 60 || { tui_stop; return 1; }
+
+  ok=0
+  rt_run "$vm" "test ! -e /etc/samba/smb.conf && test -f /etc/samba/smb.conf.orig" >/dev/null || ok=1
+  rt_verdict "on the guest, the file moved: smb.conf gone, smb.conf.orig in its place" "$ok"
+
+  # The preflight again: the condition the tool cleared is gone and the one it
+  # cannot is still there, which is the difference between a fix and a message.
+  tui_keys Escape
+  dc_ready 60 || { tui_stop; return 1; }
+  tui_keys P
+  tui_wait_for "Provisioning cannot start" 20 || { tui_stop; return 1; }
+  tui_shot "preflight-package-only"
+  body="$(dc_screen)"
+  dc_lacks "$body" "/etc/samba/smb.conf configures this host as" \
+    "re-opened, the preflight no longer names the smb.conf it moved"
+  dc_has "$body" "the AD provisioning data is not installed" \
+    "and still names the package condition, which is the operator's to clear"
+  dc_has "$body" "There is nothing for this tool to run here" \
+    "with nothing left to offer, it says so instead of offering a command"
+  tui_keys Escape
+  tui_stop
+
+  # -- 4. the package is the operator's job --------------------------------
+  # Outside the tool, which is the point: the tool states the packages and does
+  # not install them. dnf by name rather than through vm_install because this
+  # flow is Fedora's and these are the two package names the condition printed.
+  log "installing the DC packages the tool named (outside the tool)"
+  ok=0
+  rt_run "$vm" "sudo -n dnf -y -q install samba-dc-provision samba-dc" >/dev/null || ok=1
+  rt_verdict "the packages the preflight named install on the guest" "$ok"
+
+  tui_start "$vm" "TERM=xterm-256color $dc_bin_path"
+  dc_ready 90 || { tui_stop; return 1; }
+  tui_keys P
+  ok=1; tui_wait_for "Provision 1/6" 20 && ok=0
+  tui_shot "wizard-realm"
+  rt_verdict "with the packages in place the preflight is clean and the wizard opens" "$ok"
+  ((ok == 0)) || { tui_stop; return 1; }
+
+  # -- 5. the wizard, end to end -------------------------------------------
+  tui_type "$dc_realm"
+  tui_keys Enter
+  tui_wait_for "Provision 2/6" 20 || { tui_stop; return 1; }
+  body="$(dc_screen)"
+  dc_has "$body" "> $dc_netbios" \
+    "the NetBIOS step suggests $dc_netbios, derived from the realm's first label"
+  tui_shot "wizard-netbios"
+  tui_keys Enter
+
+  tui_wait_for "Provision 3/6" 20 || { tui_stop; return 1; }
+  tui_pick "SAMBA_INTERNAL" || { tui_stop; return 1; }
+
+  tui_wait_for "Provision 4/6" 20 || { tui_stop; return 1; }
+  tui_type "$dc_forwarder"
+  tui_shot "wizard-forwarder"
+  tui_keys Enter
+
+  # The address step: the question that only exists because this guest has two
+  # addresses, and the answer that decides the DC's own A record.
+  tui_wait_for "Provision 5/6" 20 || { tui_stop; return 1; }
+  tui_shot "wizard-address-picker"
+  body="$(dc_screen)"
+  dc_has "$body" "$dc_guest_ip on $iface" \
+    "the address picker lists the guest's real address, $dc_guest_ip on $iface"
+  dc_has "$body" "$dc_fixture_ip on $dc_fixture_if" \
+    "and the fixture address, $dc_fixture_ip on $dc_fixture_if"
+  dc_has "$body" "> $dc_guest_ip on $iface" \
+    "the address on the default route is the preselected one, not whichever came first"
+  # Accepted as it stands: the preselection is the answer under test.
+  tui_keys Enter
+
+  tui_wait_for "Provision 6/6" 20 || { tui_stop; return 1; }
+  tui_type "$dc_realm"
+  tui_keys Enter
+
+  # -- 6. the preview is the evidence --------------------------------------
+  # What the dialog shows is what runs, so this is the one place the wizard's
+  # six answers can be checked as a command line. The three --option arguments
+  # carry spaces in the smb.conf parameter names and the preview quotes them;
+  # the assertions are on the quoted text the reader sees.
+  tui_wait_for "Command to run:" 30 || { tui_stop; return 1; }
+  tui_shot "provision-preview"
+  preview="$(dc_screen)"
+  dc_has "$preview" "--realm=$(printf '%s' "$dc_realm" | tr '[:lower:]' '[:upper:]')" \
+    "the previewed command provisions the realm the wizard was given, upper-cased"
+  dc_has "$preview" "--domain=$dc_netbios" \
+    "with the NetBIOS domain it derived"
+  dc_has "$preview" "--host-ip=$dc_guest_ip" \
+    "the chosen address is --host-ip=$dc_guest_ip, so the A record is not a guess"
+  dc_has "$preview" "'--option=dns forwarder=$dc_forwarder'" \
+    "the forwarder travels as the quoted smb.conf option 'dns forwarder=$dc_forwarder'"
+  dc_has "$preview" "'--option=interfaces=lo $iface'" \
+    "the chosen address implies 'interfaces=lo $iface' — the DC is bound, not spread"
+  dc_has "$preview" "'--option=bind interfaces only=yes'" \
+    "and 'bind interfaces only=yes', which is what keeps the held port 53 out of its way"
+
+  # -- 7. the result screen keeps the password -----------------------------
+  # A provision takes minutes. What it prints once, and nowhere else, is the
+  # Administrator password: so the assertion is that the screen carries it, and
+  # the capture is scrubbed before it reaches a file.
+  log "confirming the provision — this takes minutes"
+  tui_keys y
+  tui_wait_for "The domain is provisioned" 900 || { tui_stop; return 1; }
+  sleep 2
+  # No `exit` in the awk program, and the pane captured into a variable first:
+  # an awk that leaves a pipeline early hands the stage before it a SIGPIPE, and
+  # under `set -o pipefail` that is a failed assignment and a dead driver.
+  local pane=""
+  pane="$(tui_pane)" || pane=""
+  password="$(printf '%s\n' "$pane" | sed 's/│//g' |
+    awk '/Administrator password/ { found = 1; next }
+         found && NF && !got { print; got = 1 }')"
+  ok=1; [[ -n ${password//[[:space:]]/} ]] && ok=0
+  rt_verdict "the result screen carries the Administrator password samba-tool printed once" "$ok"
+  ok=1; [[ $(printf '%s' "$password" | wc -w) -eq 1 ]] && ok=0
+  rt_verdict "the password line is one token — nothing of it was split or swallowed" "$ok"
+  # From here on every capture of this screen carries the password, so it is
+  # scrubbed at the source rather than at each caller.
+  tui_secret="${password//[[:space:]]/}"
+  tui_shot "provision-result"
+  body="$(dc_screen)"
+  dc_has "$body" "Server Role: active directory domain controller" \
+    "the screen keeps samba's own summary: the new role"
+  dc_has "$body" "DNS Domain: $dc_realm" \
+    "and the DNS domain it created"
+  # samba's own WARNING lines are shown on this screen and nowhere else, but
+  # whether there are any is samba's decision, not the tool's: on 4.24.6 a
+  # successful provision with --host-ip given prints none — the "More than one
+  # IPv4 address found" warning is exactly what answering the address step
+  # removes, and the IPv6 lookup is logged at INFO. So this is recorded rather
+  # than asserted: a run that demanded the warning block be present would be
+  # demanding that something had gone wrong.
+  if [[ $body == *"What provision warned about"* ]]; then
+    rt_say "NOTE  this provision printed WARNING lines, and the screen shows them"
+  else
+    rt_say "NOTE  this provision printed no WARNING line, so there is no warning block"
+  fi
+
+  # -- 8. the ordered follow-ups -------------------------------------------
+  # The order is the finding. On Fedora samba runs the MIT KDC, the KDC reads
+  # /etc/krb5.conf, and Fedora ships that file with no default_realm — so the
+  # unit the tool used to offer first died with nothing in the journal but
+  # "mitkdc child process exited". The Kerberos drop-in has to come first.
+  tui_keys Enter
+  tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
+  preview="$(dc_screen)"
+  dc_has "$preview" "install -m 644 /var/lib/samba/private/krb5.conf /etc/krb5.conf.d/samba-dc.conf" \
+    "the first step offered is the Kerberos drop-in, previewed as one install command"
+  dc_lacks "$preview" "systemctl enable" \
+    "the unit is not what the first step starts — the order the MIT KDC requires"
+  dc_confirm "krb5-dropin" "done: Install the generated Kerberos" 60 || { tui_stop; return 1; }
+
+  tui_keys Enter
+  tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
+  preview="$(dc_screen)"
+  dc_has "$preview" "systemctl enable --now $dc_unit" \
+    "the second step is the unit, now that the KDC has a realm to read"
+  dc_confirm "enable-unit" "done: Enable and start" 180 || { tui_stop; return 1; }
+
+  ok=0
+  rt_run "$vm" "test -f /etc/krb5.conf.d/samba-dc.conf" >/dev/null || ok=1
+  rt_verdict "on the guest, /etc/krb5.conf.d/samba-dc.conf is in place" "$ok"
+  ok=1
+  [[ "$(rt_run "$vm" "systemctl is-active $dc_unit" || true)" == active ]] && ok=0
+  rt_verdict "on the guest, $dc_unit is active — the unit that used to exit on the MIT KDC" "$ok"
+  tui_stop
+
+  # -- 9. the domain answers -----------------------------------------------
+  # The tool's own read path against the controller it just created, and then
+  # the two questions a domain member would ask it.
+  check="$(rt_run "$vm" "sudo -n $dc_bin_path --check")" || true
+  printf '%s\n' "$check" >"$logdir/check.json"
+  ok="$(dc_json "$check" 'd.get("isDomainController")')"
+  rt_verdict "tui-dc --check reads this host as a domain controller" "$ok"
+  ok="$(dc_json "$check" 'd.get("zoneRead")')"
+  rt_verdict "tui-dc --check read the domain's DNS zone" "$ok"
+  ok="$(dc_json "$check" 'd.get("dnsRecords", 0) > 0')"
+  rt_verdict "and found records in it" "$ok"
+  ok="$(dc_json "$check" 'd.get("replicationRead")')"
+  rt_verdict "tui-dc --check read replication from the controller" "$ok"
+  ok="$(dc_json "$check" 'd.get("replicationOk")')"
+  rt_verdict "and reports it healthy on a single-DC domain" "$ok"
+
+  body="$(rt_run "$vm" "host -t A $dc_name $dc_guest_ip")" || true
+  dc_has "$body" "has address $dc_guest_ip" \
+    "the controller's own name resolves to $dc_guest_ip through its own DNS"
+  body="$(rt_run "$vm" "host -t A tui.tools $dc_guest_ip")" || true
+  dc_has "$body" "has address" \
+    "an outside name resolves through the forwarder the wizard set"
+
+  dc_fixture_down "$vm"
+
+  echo
+  if ((rt_rc)); then
+    rt_say "VERDICT  the provision wizard on a real Fedora guest: FAIL"
+  else
+    rt_say "VERDICT  the provision wizard on a real Fedora guest: PASS"
+  fi
+  rt_say "The guest is left provisioned. Restore the snapshot before running this again:"
+  rt_say "  ./lab.sh down $vm && ./lab.sh restore $vm pre-dc && ./lab.sh up $vm --mem 4096"
+  log "evidence: $rt_log"
+  log "panes: $tui_shots"
+  return $rt_rc
+}
+
+cmd_dc() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    test) cmd_dc_test "$@" ;;
+    *) die "dc: expected test" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
 # The header block above is the usage text: printed from line 2 until the
@@ -2971,6 +3471,7 @@ case "$cmd" in
   test) cmd_test "${1:?tool}" "${@:2}" ;;
   report) cmd_report "${1:?tool|all}" "${@:2}" ;;
   router) cmd_router "$@" ;;
+  dc) cmd_dc "$@" ;;
   all)
     sub="${1:?up|down|status}"; shift
     case "$sub" in

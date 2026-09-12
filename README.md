@@ -72,6 +72,7 @@ A first `lab.sh all up` on a cold cache takes a few minutes, most of it download
 ./lab.sh report tui-firewall     # check the --report block on all three
 ./lab.sh report tui-secure fedora # one VM
 ./lab.sh report all              # every sibling tool checkout
+./lab.sh dc test fedora          # drive tui-dc's provision wizard on a real guest
 ./lab.sh snapshot ubuntu clean   # qcow2 snapshot (VM must be stopped)
 ./lab.sh restore ubuntu clean
 ./lab.sh all down
@@ -172,6 +173,41 @@ It builds and ships the binary exactly the way `test` does, prints both blocks t
 4. The `--demo` block says **`backend: demo`**. A demo block that does not announce itself is the worst kind of bug report: every number in it is sample data and nothing says so.
 
 A failed assertion shows the offending line and fails the command, so it fits a pre-release check. `report all` does the same for every sibling checkout that has a `cmd/<name>` package.
+
+### `lab.sh dc test`, the provision wizard on a machine that can refuse it
+
+Creating a domain is the one flow in the family that cannot be proved anywhere but on a real machine. What `tui-dc`'s wizard builds is a `samba-tool domain provision`, and everything that decides whether the controller it creates can actually serve the domain is a fact about the machine it runs on: the distribution's own `smb.conf` standing in the way, the AD schema package that is not installed, which of the host's addresses lands in the DC's own A record, whether the internal DNS server can bind port 53, whether the MIT KDC finds a realm to read. A fake backend can render every one of those screens and prove none of them.
+
+So `dc test` is the router flow's method pointed at one guest: `tmux` drives the real TUI inside the VM, every confirm dialog is captured **before** the key that accepts it, and every assertion is then made against the guest itself rather than against the screen that claimed it. The log and the numbered pane captures land under `out/results/<stamp>-dc/`, and the command exits non-zero if any assertion failed.
+
+```bash
+./lab.sh up fedora --mem 4096
+./lab.sh snapshot fedora pre-dc          # stop the VM first; see below
+./lab.sh dc test fedora --bin /path/to/tui-dc
+```
+
+What the run walks, in order: the preflight naming both of its refusals and stopping before the wizard's first question; the previewed `mv` of the distribution's `smb.conf`, accepted through the tool's own confirm and then verified on disk; the preflight re-opened with only the condition the tool cannot clear left; the wizard's six answers; the confirm dialog's command line, checked argument by argument; the result screen's Administrator password, summary and warnings; the two follow-up steps in the order the MIT KDC requires; and finally the domain answering — `tui-dc --check` against the controller it just created, the controller's own name resolved through its own DNS, and an outside name resolved through the forwarder the wizard set.
+
+**The DC packages are installed by the run, not by the seed.** The Fedora guest comes up with `samba` and `samba-tools` and nothing more, because "`samba-tool` is here and the AD schema is not" is exactly the state one of the preflight's two conditions exists for. The run installs `samba-dc-provision` and `samba-dc` itself, with `dnf`, outside the tool — which is the assertion, not a shortcut: the tool names the packages and does not install them, and this is where that is proved.
+
+**The multi-homed fixture.** Before the tool is started, the run gives the guest a second address — a dummy interface at `10.90.0.1/24` — and a few lines of Python holding UDP port 53 on it under a transient unit. Both halves are load-bearing:
+
+- The wizard *skips* its address question on a host with one address, so a single-homed guest cannot prove that the picker offers this host's addresses, that the one on the default route is preselected, or that the answer becomes `--host-ip`.
+- `bind interfaces only=yes` is indistinguishable from not setting it until something else already holds port 53 on an address the controller would otherwise have claimed. That is the shape of every host running libvirt or docker, and it is why a DC provisioned there never starts.
+
+The fixture is torn down at the end of the run; the provisioned domain is not.
+
+**A provision is not idempotent**, so the guest is single-use. Take the snapshot while the VM is stopped and go back to it between attempts:
+
+```bash
+./lab.sh down fedora && ./lab.sh restore fedora pre-dc && ./lab.sh up fedora --mem 4096
+```
+
+Two things the run does not do. It never prints the Administrator password: the assertion is that the result screen carries one and that the line holds exactly one token, and the captures are scrubbed at the single point every pane capture comes through, so no committed file or log can carry it. And it does not replace `lab.sh test tui-dc` — several of that smoke test's assertions only mean anything on a controller, so the useful order is this flow first and then, against the same now-provisioned guest:
+
+```bash
+./lab.sh test tui-dc fedora --bin /path/to/tui-dc
+```
 
 ## Results from a real run
 
