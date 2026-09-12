@@ -17,7 +17,7 @@ It is glue, so it is one bash script.
 | `fedora` | Fedora Cloud Base Generic 44 | `firewalld`, installed by the seed | `snapper` on a btrfs data disk, mounted with an SELinux `context=` | **Root is btrfs**; SELinux **enforcing**; `cronie`, so the lab has one `crond.service` machine; `samba` + `samba-tools`, so the lab has one machine with a real `samba-tool` |
 | `omarchy` | [Omarchy Server](https://github.com/edimarlnx/omarchy-server) cloud image | `ufw`, already `limit 22/tcp` | `snapper` ships in the image | Root is btrfs; seeded with **nothing** |
 
-The Omarchy VM installs no packages on purpose. The point of that machine is the image exactly as shipped; adding to it would stop testing the artifact.
+The Omarchy VM's **seed** installs no packages on purpose. The point of that machine is the image exactly as shipped; adding to it from cloud-init would stop testing the artifact. What a flow needs in order to exist at all it installs itself, at the point where installing it is the thing under test — `dc seed` puts samba on the Ubuntu and Omarchy guests for exactly that reason, with the guest's own package manager, and says so in its log.
 
 ### Image facts recorded from the run below
 
@@ -72,7 +72,9 @@ A first `lab.sh all up` on a cold cache takes a few minutes, most of it download
 ./lab.sh report tui-firewall     # check the --report block on all three
 ./lab.sh report tui-secure fedora # one VM
 ./lab.sh report all              # every sibling tool checkout
+./lab.sh dc seed omarchy         # put a guest in the pre-provision state tui-dc needs
 ./lab.sh dc test fedora          # drive tui-dc's provision wizard on a real guest
+./lab.sh dc test ubuntu          # the same flow, asserting what is true on Ubuntu
 ./lab.sh snapshot ubuntu clean   # qcow2 snapshot (VM must be stopped)
 ./lab.sh restore ubuntu clean
 ./lab.sh all down
@@ -174,40 +176,87 @@ It builds and ships the binary exactly the way `test` does, prints both blocks t
 
 A failed assertion shows the offending line and fails the command, so it fits a pre-release check. `report all` does the same for every sibling checkout that has a `cmd/<name>` package.
 
-### `lab.sh dc test`, the provision wizard on a machine that can refuse it
+### `lab.sh dc test`, the provision wizard on all three machines
 
-Creating a domain is the one flow in the family that cannot be proved anywhere but on a real machine. What `tui-dc`'s wizard builds is a `samba-tool domain provision`, and everything that decides whether the controller it creates can actually serve the domain is a fact about the machine it runs on: the distribution's own `smb.conf` standing in the way, the AD schema package that is not installed, which of the host's addresses lands in the DC's own A record, whether the internal DNS server can bind port 53, whether the MIT KDC finds a realm to read. A fake backend can render every one of those screens and prove none of them.
+Creating a domain is the one flow in the family that cannot be proved anywhere but on a real machine. What `tui-dc`'s wizard builds is a `samba-tool domain provision`, and everything that decides whether the controller it creates can actually serve the domain is a fact about the machine it runs on: the distribution's own `smb.conf` standing in the way, the AD schema package that is not installed, which of the host's addresses lands in the DC's own A record, whether the internal DNS server can bind port 53, whether the Kerberos KDC samba was built against finds a realm to read. A fake backend can render every one of those screens and prove none of them.
 
-So `dc test` is the router flow's method pointed at one guest: `tmux` drives the real TUI inside the VM, every confirm dialog is captured **before** the key that accepts it, and every assertion is then made against the guest itself rather than against the screen that claimed it. The log and the numbered pane captures land under `out/results/<stamp>-dc/`, and the command exits non-zero if any assertion failed.
+And every one of those facts has a **different answer per distribution**, which is why this flow runs on all three guests rather than on the one it was written against. A release cut from a single guest's run would be a release whose evidence is one distribution's answers — and three of the four facts above turn out to differ between Fedora, Ubuntu and Omarchy.
+
+So `dc test` is the router flow's method pointed at one guest: `tmux` drives the real TUI inside the VM, every confirm dialog is captured **before** the key that accepts it, and every assertion is then made against the guest itself rather than against the screen that claimed it. Nothing about the distribution is assumed: the facts are read off the guest first, each recorded with the command that established it, and the assertions branch on what was read. Every row of the table names the guest it is about. The log, the numbered pane captures and the verbatim quotes land under `out/results/<stamp>-dc-<vm>/`, and the command exits non-zero if any assertion failed.
 
 ```bash
-./lab.sh up fedora --mem 4096
-./lab.sh snapshot fedora pre-dc          # stop the VM first; see below
+./lab.sh up fedora --mem 4096                     # 2 GB is too tight to provision in
+./lab.sh dc seed fedora                           # the operator's half: samba-tool, no AD schema
+./lab.sh down fedora && ./lab.sh snapshot fedora pre-dc && ./lab.sh up fedora --mem 4096
 ./lab.sh dc test fedora --bin /path/to/tui-dc
+./lab.sh test tui-dc fedora --bin /path/to/tui-dc # several of its checks only mean anything on a DC
 ```
 
-What the run walks, in order: the preflight naming both of its refusals and stopping before the wizard's first question; the previewed `mv` of the distribution's `smb.conf`, accepted through the tool's own confirm and then verified on disk; the preflight re-opened with only the condition the tool cannot clear left; the wizard's six answers; the confirm dialog's command line, checked argument by argument; the result screen's Administrator password, summary and warnings; the two follow-up steps in the order the MIT KDC requires; and finally the domain answering — `tui-dc --check` against the controller it just created, the controller's own name resolved through its own DNS, and an outside name resolved through the forwarder the wizard set.
+`dc seed` is a command of its own because a guest has to be brought to one particular state before any of this proves anything: **`samba-tool` installed and the AD schema absent**. That is the state the preflight's second condition exists for, and a guest already past it proves neither condition. The Fedora guest gets there from cloud-init; the other two get there from `dc seed`, which installs samba with the guest's own package manager and then takes the same stance the Fedora seed does — the file server and the tools, and nothing that carries the AD DC.
 
-**The DC packages are installed by the run, not by the seed.** The Fedora guest comes up with `samba` and `samba-tools` and nothing more, because "`samba-tool` is here and the AD schema is not" is exactly the state one of the preflight's two conditions exists for. The run installs `samba-dc-provision` and `samba-dc` itself, with `dnf`, outside the tool — which is the assertion, not a shortcut: the tool names the packages and does not install them, and this is where that is proved.
+#### What the three runs established
 
-**The multi-homed fixture.** Before the tool is started, the run gives the guest a second address — a dummy interface at `10.90.0.1/24` — and a few lines of Python holding UDP port 53 on it under a transient unit. Both halves are load-bearing:
+Read off the guests, not written into the script. Each was recorded with the command that produced it.
+
+| Fact | `fedora` | `ubuntu` | `omarchy` |
+|------|----------|----------|-----------|
+| os-release `ID` | `fedora` | `ubuntu` | `omarchy-server` (`ID_LIKE=omarchy arch`) |
+| samba | 4.24.6 | 4.19.5-Ubuntu | 4.24.7 |
+| `samba-tool` comes from | `samba-tools` | `samba-common-bin` | `samba` |
+| the AD schema comes from | `samba-dc-provision` | `samba-ad-provision` | **`samba`, the same package** |
+| the AD DC unit | **`samba.service`** | **`samba-ad-dc.service`** | **`samba.service`** |
+| …shipped by | `samba-dc`, a package of its own | `samba`, the file server's | `samba` |
+| Kerberos samba was built against | **MIT** (`USING_SYSTEM_MITKRB5`) | **Heimdal** (`USING_EMBEDDED_HEIMDAL`) | **Heimdal** |
+| ships an `/etc/samba/smb.conf` | yes | yes, written by the postinst | **no** |
+| `/etc/krb5.conf.d` | present | absent | absent |
+| an effective `default_realm` | commented out | no `/etc/krb5.conf` at all | `ATHENA.MIT.EDU`, from the MIT sample |
+| so the Kerberos drop-in step is | **offered, and required** | not offered | not offered, for two reasons |
+| table rows | 46 PASS | 46 PASS | 41 PASS |
+
+The commands behind the package column, run in the guest: `rpm -qf` and `dnf repoquery --file` on Fedora, `dpkg -S` and `apt-file -l -x search` on Ubuntu, `pacman -Qoq` and `pacman -Fq` on Omarchy. The installed query comes first because it is exact; the repository query is the one that matters, since the whole point is naming a package for a file that is **missing**.
+
+Three of those rows are worth stating on their own.
+
+**The unit name is not a distribution's name, and now it is proved on three.** `tui-dc`'s `DetectDCUnit` stats four paths rather than mapping a distribution to a unit name, and these runs are where that pays: Debian and Ubuntu ship `samba-ad-dc.service`, Fedora and Arch ship `samba.service` — and on Fedora that is the name a *different* package uses for `smbd`, which is exactly why the file on disk has to decide. Each run asserts that the unit the tool previews in its last step is the unit the lab found on disk independently.
+
+**Arch ships the AD schema in the same package as `samba-tool`.** So the preflight's "the AD provisioning data is not installed" condition cannot happen on Arch at all: a guest with a working `samba-tool` always has the schema. That is a fact about the distribution, and it is recorded as one — but it would also leave the screen this family has no other way to reach unseen there, so `dc seed` constructs the state by moving the directory to `/usr/share/samba/setup/ad-schema.lab-aside` and `dc test` moves it back in the step where the other guests install a package.
+
+**Only Fedora gets the Kerberos drop-in, and for the reason the tool says.** `tui-dc` offers it where three facts hold: the transcript named the generated file, `/etc/krb5.conf.d` exists, and `/etc/krb5.conf` sets no `default_realm`. On Fedora all three hold and the step is also *necessary*, because samba runs the MIT KDC and the unit dies at startup with nothing in the journal but `mitkdc child process exited` without it. On Ubuntu and Omarchy samba carries its own Heimdal, so the KDC never reads `/etc/krb5.conf`, there is no `/etc/krb5.conf.d` to drop into either, and the result screen says to merge the generated file by hand instead — which the runs assert rather than skip.
+
+#### The operator's half, which is bigger than Fedora suggested
+
+The tool names what is missing and never installs it. On Fedora that is two packages and the story ends; on the other two, getting from "provision refused" to "a controller that serves" needed a list, and every entry on it was found by a provision that died on it. They are in `dc_dc_extras` in the script with the failure each one prevents written beside it:
+
+| Guest | What the run installs past the schema package | Why |
+|-------|-----------------------------------------------|-----|
+| `fedora` | nothing | `samba-dc` pulls what it needs |
+| `ubuntu` | `samba-dsdb-modules` | without it provision reaches `secrets.ldb`, says `Module [samba_secrets] not found`, then dies on `'NoneType' object has no attribute 'startswith'` |
+| | `samba-vfs-modules` | provision loads `acl_xattr` through an in-process `smbd` to put the ACL on sysvol; without it, `Error loading module …/vfs/acl_xattr.so` then `create_conn_struct: smbd_vfs_init failed` |
+| | `python3-markdown` | samba's forest update imports it |
+| | `winbind` | the AD DC forks `/usr/sbin/winbindd`; without it the unit dies in the same second on `Failed to exec child - No such file or directory` |
+| `omarchy` | `python-markdown` | provision gets as far as `Fixing provision GUIDs` and dies in `forest_update.py` on `No module named 'markdown'` |
+| | `python-cryptography` (in `dc seed`) | without it **no** `samba-tool` subcommand runs at all, so the guest never reaches the wizard |
+
+The first four are `Recommends` or `Suggests` of Ubuntu's `samba` — which is why a default `apt install samba` has three of them and an install with recommends off has none, and why `winbind`, only *suggested*, is missing either way. The two Arch ones are dependencies its `samba` package simply does not declare.
+
+**And one step that is not a package.** Debian and Ubuntu enable `smbd` and `nmbd` when `samba` is installed. An AD DC forks its own `smbd`, and a standalone one already holding 139 and 445 makes that fork die and takes the unit with it — the journal says `samba_terminate: … smbd child process exited` and nothing about a port. So the run stops the standalone file server before the tool's unit step, records which units it found running, and says so in the table. Fedora and Arch enable nothing, so there it is a no-op and the run says that instead.
+
+#### The multi-homed fixture
+
+Before the tool is started, the run gives the guest a second address — a dummy interface at `10.90.0.1/24` — and a few lines of Python holding UDP port 53 on it under a transient unit. Both halves are load-bearing:
 
 - The wizard *skips* its address question on a host with one address, so a single-homed guest cannot prove that the picker offers this host's addresses, that the one on the default route is preselected, or that the answer becomes `--host-ip`.
 - `bind interfaces only=yes` is indistinguishable from not setting it until something else already holds port 53 on an address the controller would otherwise have claimed. That is the shape of every host running libvirt or docker, and it is why a DC provisioned there never starts.
 
-The fixture is torn down at the end of the run; the provisioned domain is not.
+The interface the option names is read off the guest rather than written down — it is `enp0s4` on these images and the assertion is built from what the guest said. The fixture is torn down at the end of the run; the provisioned domain is not. `host(1)` for the closing DNS questions is installed under the name the guest's own package manager gave for it, which is `bind-utils`, `bind9-host` and `bind` on the three.
 
 **A provision is not idempotent**, so the guest is single-use. Take the snapshot while the VM is stopped and go back to it between attempts:
 
 ```bash
-./lab.sh down fedora && ./lab.sh restore fedora pre-dc && ./lab.sh up fedora --mem 4096
+./lab.sh down <vm> && ./lab.sh restore <vm> pre-dc && ./lab.sh up <vm> --mem 4096
 ```
 
-Two things the run does not do. It never prints the Administrator password: the assertion is that the result screen carries one and that the line holds exactly one token, and the captures are scrubbed at the single point every pane capture comes through, so no committed file or log can carry it. And it does not replace `lab.sh test tui-dc` — several of that smoke test's assertions only mean anything on a controller, so the useful order is this flow first and then, against the same now-provisioned guest:
-
-```bash
-./lab.sh test tui-dc fedora --bin /path/to/tui-dc
-```
+Two things the run does not do. It never prints the Administrator password: the assertion is that the result screen carries one and that the line holds exactly one token, and the captures are scrubbed at the single point every pane capture comes through, so no committed file or log can carry it. And the read path at the end is **polled rather than taken once** — `systemctl is-active` going green and the controller answering `drs showrepl -P` are not the same moment, and read immediately, Ubuntu's 4.19.5 reported no replication while Fedora's 4.24.6 did. A difference in start-up time asserted as a difference in the tool is a bad assertion; how long the wait actually took is recorded instead.
 
 ## Results from a real run
 
@@ -243,6 +292,9 @@ done
 | **tui-cert** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** |
 | **tui-samba** | version, demo frame, smoke **18/18** | version, demo frame, smoke **21/21** — see below | version, demo frame, smoke **18/18** |
 | **tui-containers** | version, demo frame, smoke **15/15** | version, demo frame, smoke **13/13** | version, demo frame, smoke **15/15** — see below |
+| **tui-dc** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** |
+
+The `tui-dc` row is from `2026-09-12` and is the only one of these taken on a guest the lab had already changed on purpose: each of the three was a domain controller by the time the smoke test ran, provisioned minutes earlier through the tool's own wizard by `dc test`. That is deliberate — five of that smoke test's assertions compare the tool's counts against `samba-tool`'s own on a live directory and are skipped on a machine that serves none. The samba version each run exercised was appended to `compat/results.jsonl` in the guest, which is what feeds the tool's compat block: 4.24.6 on Fedora 44, 4.19.5-Ubuntu on Ubuntu 24.04, 4.24.7 on Omarchy Server 4.0.1, all three `pass`.
 
 Backend coverage behind those numbers:
 
