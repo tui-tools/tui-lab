@@ -13,7 +13,7 @@
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
 #   lab.sh router [--backend qemu|libvirt] up|down|status|test [--via-tool [PATH]|--traffic|--dhcp|--vpn|--gateways]
-#   lab.sh dc test [vm] [--bin PATH]
+#   lab.sh dc seed <vm> | dc test [vm] [--bin PATH]
 #   lab.sh test <tool> [vm...] [--bin PATH] [--keep]
 #   lab.sh report <tool|all> [vm...] [--bin PATH]
 #   lab.sh fetch <vm> | images
@@ -2988,7 +2988,7 @@ cmd_router() {
 }
 
 # ---------------------------------------------------------------------------
-# dc test: the provision wizard, driven end to end on a real Fedora guest
+# dc: the provision wizard, driven end to end on a real guest of any distro
 # ---------------------------------------------------------------------------
 # Creating a domain is the one flow in this family that cannot be proved
 # anywhere but on a real machine. What the wizard builds is a `samba-tool domain
@@ -2996,39 +2996,62 @@ cmd_router() {
 # actually serve the domain is a fact about that machine: the distribution's own
 # smb.conf standing in the way, the AD schema package that is not installed,
 # which of the host's addresses lands in the DC's own A record, whether the
-# internal DNS server can bind port 53, whether the MIT KDC finds a realm. A
-# fake backend can render every one of those screens and prove none of them.
+# internal DNS server can bind port 53, whether the Kerberos KDC samba was built
+# against finds a realm. A fake backend can render every one of those screens and
+# prove none of them.
 #
 # So this is the router flow's method pointed at one guest: tmux drives the real
 # TUI, every confirm dialog is captured before the key that accepts it, and
 # every assertion is made against the guest itself rather than against the
 # screen that claimed it.
 #
+# It runs on any of the three guests, and that is the point of the flow rather
+# than a convenience. Every fact above is a different fact per distribution, and
+# a release cut from one guest's run would be a release whose evidence is one
+# distribution's answers:
+#
+#   * which package carries samba-tool, and which one carries the AD schema —
+#     on Arch they are the same package, which makes one of the preflight's two
+#     conditions unreachable there unless the lab constructs it;
+#   * which unit the AD DC runs under. tui-dc's DetectDCUnit decides by which
+#     unit file exists rather than by mapping a distribution to a name, and this
+#     run is what proves the answer on each;
+#   * whether samba was built against the MIT KDC (so the Kerberos drop-in step
+#     is offered and required) or against the embedded Heimdal (so it is
+#     neither, and the result screen says something else);
+#   * whether the distribution ships an /etc/samba/smb.conf at all, which is
+#     what decides whether the preflight's first condition appears.
+#
+# None of those are assumed. Each is read off the guest before the tool is
+# started, recorded with the command that established it, and the assertions
+# branch on what was read — so a PASS means the tool was right about *this*
+# distribution, and the table says which one it is talking about.
+#
 # Two things the run does to the guest, both on purpose:
 #
-#   * It installs samba-dc-provision and samba-dc itself, outside the tool. The
-#     seed deliberately ships samba and samba-tools and nothing more, because
+#   * It installs the AD DC packages itself, outside the tool, by the names the
+#     guest's own package manager gives for the files they carry. A guest in the
+#     state `dc seed` leaves it in has samba-tool and no AD schema, because
 #     "samba-tool is here and the AD schema is not" is the state one of the
 #     preflight's two conditions exists for. Installing packages is not the
-#     tool's job, and this run is where that is proved: the tool names the
-#     packages, the lab installs them.
+#     tool's job, and this run is where that is proved: the tool names what is
+#     missing, the lab installs it.
 #   * It gives the guest a second address and something holding DNS on it (see
 #     dc_fixture_up). Half of what this flow proves only exists on a multi-homed
 #     host.
 #
 # The guest is left provisioned, and a provision is not idempotent, so a second
-# run starts from the snapshot this one expects:
+# run starts from the snapshot `dc seed` tells you to take:
 #
-#   ./lab.sh down fedora && ./lab.sh restore fedora pre-dc && ./lab.sh up fedora --mem 4096
+#   ./lab.sh down <vm> && ./lab.sh restore <vm> pre-dc && ./lab.sh up <vm> --mem 4096
 
-# The realm is a documentation name and the addresses are the lab's own: the
-# guest's qemu user-mode address, that network's DNS forwarder, and the fixture
-# address below.
+# The realm is a documentation name and the forwarder is the qemu user-mode
+# network's own resolver. The guest's address and interface are read off the
+# guest rather than written here: the three distributions do not agree on what
+# the first interface is called.
 dc_realm="lab.example"
 dc_netbios="LAB"
 dc_forwarder="10.0.2.3"
-dc_guest_ip="10.0.2.15"
-dc_unit="samba.service"
 
 # The fixture: a dummy interface with an address of its own, and a process
 # sitting on port 53 there.
@@ -3040,6 +3063,427 @@ dc_fixture_unit="lab-dns-hold"
 # /tmp/tui-dc: `lab.sh test tui-dc` ships one there and a running binary cannot
 # be overwritten in place.
 dc_bin_path="/tmp/tui-dc-drive"
+
+# The paths the tool's own DetectDCUnit stats, in its order. They are repeated
+# here rather than derived because this is the lab's independent reading of the
+# same disk: if the tool and this list ever disagree about which unit a guest
+# has, that disagreement is the finding.
+dc_unit_paths=(
+  "samba-ad-dc.service:/usr/lib/systemd/system/samba-ad-dc.service"
+  "samba-ad-dc.service:/lib/systemd/system/samba-ad-dc.service"
+  "samba.service:/usr/lib/systemd/system/samba.service"
+  "samba.service:/lib/systemd/system/samba.service"
+)
+
+# Where the AD schema lives, and where `dc seed` parks it on a distribution that
+# ships it in the same package as samba-tool. See dc_seed_hide_schema.
+dc_schema_dir="/usr/share/samba/setup/ad-schema"
+dc_schema_aside="$dc_schema_dir.lab-aside"
+
+# ---------------------------------------------------------------------------
+# the per-distribution facts, read off the guest
+# ---------------------------------------------------------------------------
+# Every one of these is something the flow used to assume was Fedora's answer.
+# They are globals rather than a return value because a dozen assertions below
+# read them, and a fact that had to be re-read per assertion would be a dozen
+# more ssh round trips for a value that cannot change mid-run.
+dc_where=""            # how the PASS/FAIL table names this guest
+dc_id=""               # os-release ID
+dc_pretty=""           # os-release PRETTY_NAME, which is what tui-dc prints
+dc_pm=""               # dnf | apt | pacman
+dc_iface=""            # the default-route interface
+dc_guest_ip=""         # the address on it
+dc_samba_version=""
+dc_samba_numeric=""    # just the X.Y.Z of it, which is what the header shows
+dc_smbconf=""          # present | absent — does the distribution ship one
+dc_schema=""           # present | absent
+dc_unit=""             # the unit whose file is on disk, or none
+dc_unit_expected=""    # the unit the package index says this distribution has
+dc_kdc=""              # MIT | Heimdal | unknown
+dc_krb5_dir=""         # present | absent — /etc/krb5.conf.d
+dc_krb5_realm=""       # named | unnamed | no-file — an effective default_realm
+dc_pkg_sambatool=""    # the package that carries samba-tool
+dc_pkg_schema=""       # the package that carries the AD schema
+dc_pkg_unit=""         # the package that carries the AD DC unit
+dc_pkg_dnsclient=""    # the package that carries host(1)
+dc_how_schema=""       # the query that named the AD schema's package
+dc_how_unit=""         # the query that named the AD DC unit's package
+dc_schema_one_package=0 # the schema and samba-tool come from one package
+
+# dc_fact records one fact about the guest together with the command that
+# established it, and prints both. A fact with no command beside it is an
+# assumption with better manners, and the whole reason this flow was Fedora-only
+# is that four of them were written into the assertions.
+dc_fact() {
+  local label="$1" value="$2" how="$3"
+  rt_say "FACT  [$dc_where] $label: $value"
+  [[ -z $how ]] || rt_say "      established by: $how"
+}
+
+# dc_verdict is rt_verdict with the guest named in the label. The table is read
+# across three runs and a row that does not say which distribution it is about
+# is a row that cannot be used to decide a release.
+dc_verdict() { rt_verdict "[$dc_where] $1" "$2"; }
+
+# dc_best_name picks one package name out of a possibly multi-line
+# package-manager answer. Several of these queries match more than one package,
+# because a distribution often carries a parallel build of the same thing:
+# `dnf repoquery --file /usr/bin/host` on Fedora 44 answers bind-utils and
+# bind9-next-utils, and installing the second to get host(1) would be absurd.
+# The shortest name is the plain one in every case this lab has met, and the
+# whole answer is in the log beside it either way.
+dc_best_name() {
+  local line word best=""
+  while IFS= read -r line; do
+    read -r word _ <<<"$line"
+    [[ -n $word ]] || continue
+    if [[ -z $best || ${#word} -lt ${#best} ]]; then best="$word"; fi
+  done <<<"$1"
+  printf '%s' "$best"
+}
+
+# dc_provider asks the guest's own package manager which package carries a path.
+#
+# The installed query comes first on every package manager: it is exact, needs
+# no index, and for half of these paths the file is already there. The repository
+# query is the fallback, and it is the one that matters — the whole point is to
+# name the package for a file that is *missing*, which is what the preflight's
+# second condition is about and what this tool does not know on two of the three
+# distributions here.
+#
+# kind is file or dir: apt-file matches a regexp against the Contents index and
+# pacman's file database lists a directory with its trailing slash, so a
+# directory has to be asked for differently from a file on both.
+dc_provider() {
+  local vm="$1" path="$2" kind="${3:-file}" answer="" how=""
+  local bare="${path#/}"
+  case "$dc_pm" in
+    dnf)
+      how="rpm -qf --qf '%{NAME}\\n' $path"
+      answer="$(rt_run "$vm" "rpm -qf --qf '%{NAME}\\n' $path" 2>/dev/null)" || answer=""
+      if [[ -z ${answer//[[:space:]]/} ]]; then
+        how="dnf -q repoquery --qf '%{name}\\n' --file $path"
+        answer="$(rt_run "$vm" "dnf -q repoquery --qf '%{name}\\n' --file $path | sort -u")" || answer=""
+      fi
+      ;;
+    apt)
+      how="dpkg -S $path"
+      answer="$(rt_run "$vm" "dpkg -S $path 2>/dev/null | cut -d: -f1 | sort -u")" || answer=""
+      if [[ -z ${answer//[[:space:]]/} ]]; then
+        # Anchored at the start of the path, and for a directory with the slash
+        # that makes it one: an unanchored apt-file search for /usr/bin/host
+        # answers coreutils, hostname and four more.
+        local expr="^$path\$"
+        [[ $kind == dir ]] && expr="^$path/"
+        how="apt-file -l -x search '$expr'"
+        answer="$(rt_run "$vm" "apt-file -l -x search '$expr' 2>/dev/null | sort -u")" || answer=""
+      fi
+      ;;
+    pacman)
+      how="pacman -Qoq $path"
+      answer="$(rt_run "$vm" "pacman -Qoq $path 2>/dev/null")" || answer=""
+      if [[ -z ${answer//[[:space:]]/} ]]; then
+        # pacman's file database carries paths without the leading slash, and
+        # carries a directory with a trailing one.
+        local target="$bare"
+        [[ $kind == dir ]] && target="$bare/"
+        how="pacman -Fq $target"
+        # The answer is repo/name; the repository is not what installs it.
+        answer="$(rt_run "$vm" "pacman -Fq $target 2>/dev/null | sed 's|^[^/]*/||' | sort -u")" || answer=""
+      fi
+      ;;
+  esac
+  answer="$(dc_best_name "$answer")"
+  dc_provider_answer="$answer"
+  dc_provider_how="$how"
+  [[ -n $answer ]]
+}
+
+# dc_read_facts reads everything the assertions branch on, before the tool is
+# started. It runs twice in a full run: once on the seeded guest, and once after
+# the DC packages are in, because the unit file and the AD schema only exist
+# after that and the unit is the fact DetectDCUnit is judged against.
+dc_read_facts() {
+  local vm="$1" body=""
+
+  body="$(rt_run "$vm" ". /etc/os-release; printf '%s\\n%s\\n' \"\$ID\" \"\$PRETTY_NAME\"")" || true
+  dc_id="$(printf '%s' "$body" | sed -n 1p | tr -d '[:space:]')"
+  dc_pretty="$(printf '%s' "$body" | sed -n 2p | sed 's/^ *//; s/ *$//')"
+  dc_where="${dc_pretty:-$vm}"
+  dc_fact "the guest" "$dc_pretty (os-release ID $dc_id)" ". /etc/os-release"
+
+  dc_pm="$(rt_run "$vm" "for p in dnf apt-get pacman; do command -v \$p >/dev/null && { echo \$p; break; }; done")" || true
+  dc_pm="${dc_pm//[[:space:]]/}"
+  [[ $dc_pm == apt-get ]] && dc_pm=apt
+  [[ -n $dc_pm ]] || die "no package manager this lab knows on $vm"
+  dc_fact "package manager" "$dc_pm" "command -v dnf apt-get pacman"
+
+  # The interface and the address, read rather than written down: eth0 on
+  # Fedora's cloud image, enp0s… on Ubuntu's, and the flow puts whichever it is
+  # into an `interfaces=` option it then asserts on.
+  dc_iface="$(rt_run "$vm" "ip -o -4 route show default | awk '{print \$5; exit}'")" || true
+  dc_iface="${dc_iface//[[:space:]]/}"
+  [[ -n $dc_iface ]] || die "could not read the guest's default-route interface"
+  dc_guest_ip="$(rt_run "$vm" "ip -4 -o addr show dev $dc_iface | awk '{print \$4; exit}' | cut -d/ -f1")" || true
+  dc_guest_ip="${dc_guest_ip//[[:space:]]/}"
+  [[ -n $dc_guest_ip ]] || die "could not read the guest's address on $dc_iface"
+  dc_fact "the address the controller will serve" "$dc_guest_ip on $dc_iface" \
+    "ip -o -4 route show default; ip -4 -o addr show dev $dc_iface"
+
+  # samba's version from smbd rather than from samba-tool: samba-tool is a
+  # Python program whose --version can fail for reasons that have nothing to do
+  # with the version, which is a finding of its own on one of these guests.
+  dc_samba_version="$(rt_run "$vm" "smbd -V 2>/dev/null | awk '{print \$NF}'")" || true
+  dc_samba_version="${dc_samba_version//[[:space:]]/}"
+  # The header prints a parsed version rather than the string smbd reports:
+  # Ubuntu's samba calls itself 4.19.5-Ubuntu and the compat probe reads 4.19.5
+  # out of it. Both are kept, because one is the distribution's answer and the
+  # other is what the screen can be asserted to say.
+  dc_samba_numeric="$(printf '%s' "$dc_samba_version" \
+    | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p')"
+  dc_fact "samba" "${dc_samba_version:-unknown} (version number ${dc_samba_numeric:-unknown})" "smbd -V"
+
+  dc_smbconf=absent
+  rt_run "$vm" "test -f /etc/samba/smb.conf" >/dev/null 2>&1 && dc_smbconf=present
+  dc_fact "/etc/samba/smb.conf shipped by the distribution" "$dc_smbconf" \
+    "test -f /etc/samba/smb.conf"
+
+  dc_schema=absent
+  rt_run "$vm" "test -d $dc_schema_dir" >/dev/null 2>&1 && dc_schema=present
+  dc_fact "the AD schema at $dc_schema_dir" "$dc_schema" "test -d $dc_schema_dir"
+
+  # The unit file on disk, read the way the tool reads it. This is the lab's
+  # independent answer to the question DetectDCUnit answers.
+  dc_unit=none
+  local entry unit path
+  for entry in "${dc_unit_paths[@]}"; do
+    unit="${entry%%:*}"; path="${entry#*:}"
+    if rt_run "$vm" "test -f $path" >/dev/null 2>&1; then dc_unit="$unit"; break; fi
+  done
+  dc_fact "the AD DC unit file on disk" "$dc_unit" \
+    "test -f ${dc_unit_paths[0]#*:} … (the four paths DetectDCUnit stats)"
+
+  # MIT or Heimdal. samba prints its build-time defines, and exactly one of
+  # these two appears: USING_SYSTEM_MITKRB5 when it was built against the
+  # system MIT krb5, USING_EMBEDDED_HEIMDAL when it carries its own Heimdal.
+  # It decides whether the Kerberos drop-in step is required at all, because
+  # only the MIT KDC reads /etc/krb5.conf.
+  dc_kdc=unknown
+  body="$(rt_run "$vm" "smbd -b 2>/dev/null | grep -Eo 'USING_SYSTEM_MITKRB5|USING_EMBEDDED_HEIMDAL' | sort -u")" || true
+  case "$body" in
+    *USING_SYSTEM_MITKRB5*) dc_kdc=MIT ;;
+    *USING_EMBEDDED_HEIMDAL*) dc_kdc=Heimdal ;;
+  esac
+  dc_fact "the Kerberos implementation samba was built against" "$dc_kdc" \
+    "smbd -b | grep -Eo 'USING_SYSTEM_MITKRB5|USING_EMBEDDED_HEIMDAL'"
+
+  # The two facts that decide whether tui-dc offers the drop-in: the include
+  # directory has to exist, and /etc/krb5.conf must not already name a realm.
+  dc_krb5_dir=absent
+  rt_run "$vm" "test -d /etc/krb5.conf.d" >/dev/null 2>&1 && dc_krb5_dir=present
+  dc_fact "/etc/krb5.conf.d" "$dc_krb5_dir" "test -d /etc/krb5.conf.d"
+
+  if ! rt_run "$vm" "test -f /etc/krb5.conf" >/dev/null 2>&1; then
+    dc_krb5_realm=no-file
+  elif rt_run "$vm" "grep -Eq '^[^#;]*default_realm[[:space:]]*=[[:space:]]*[^[:space:]]' /etc/krb5.conf" >/dev/null 2>&1; then
+    dc_krb5_realm=named
+  else
+    dc_krb5_realm=unnamed
+  fi
+  dc_fact "an effective default_realm in /etc/krb5.conf" "$dc_krb5_realm" \
+    "grep -E '^[^#;]*default_realm[[:space:]]*=' /etc/krb5.conf"
+}
+
+# dc_read_packages names the packages behind those files, with the guest's own
+# package manager. Separate from the facts above because it is the slower half —
+# on Debian it needs the Contents index — and because what it produces is not
+# only an assertion but a gap report: two of these three distributions are ones
+# tui-dc deliberately does not name a package for, and the run has to say what
+# the right name there actually is.
+dc_read_packages() {
+  local vm="$1" entry unit path
+
+  if dc_provider "$vm" /usr/bin/samba-tool file; then
+    dc_pkg_sambatool="$dc_provider_answer"
+    dc_fact "the package that carries samba-tool" "$dc_pkg_sambatool" "$dc_provider_how"
+  fi
+  if dc_provider "$vm" "$dc_schema_dir" dir; then
+    dc_pkg_schema="$dc_provider_answer"
+    dc_how_schema="$dc_provider_how"
+    dc_fact "the package that carries the AD schema" "$dc_pkg_schema" "$dc_how_schema"
+  fi
+  if [[ -n $dc_pkg_schema && $dc_pkg_schema == "$dc_pkg_sambatool" ]]; then
+    dc_schema_one_package=1
+    dc_fact "samba-tool and the AD schema come from one package" "$dc_pkg_schema" \
+      "the two queries above answered the same name"
+  fi
+
+  # Which unit this distribution has, asked of the package index rather than of
+  # the disk, because at this point the package is not installed yet and its
+  # unit file is the thing being looked for.
+  dc_unit_expected=""
+  dc_pkg_unit=""
+  for entry in "${dc_unit_paths[@]}"; do
+    unit="${entry%%:*}"; path="${entry#*:}"
+    [[ $path == /usr/lib/* ]] || continue
+    if dc_provider "$vm" "$path" file; then
+      dc_unit_expected="$unit"
+      dc_pkg_unit="$dc_provider_answer"
+      dc_how_unit="$dc_provider_how"
+      dc_fact "the package that carries the AD DC unit ($unit)" "$dc_pkg_unit" \
+        "$dc_how_unit"
+      break
+    fi
+  done
+  [[ -n $dc_unit_expected ]] || dc_fact \
+    "the package that carries the AD DC unit" "no package manager answer" \
+    "queried both unit paths and neither resolved"
+
+  # host(1) is the lab's, not the tool's: the zone assertions at the end need a
+  # resolver client, and it is called bind-utils, bind9-host or bind depending
+  # on whose guest this is. Asking is shorter than a table.
+  if dc_provider "$vm" /usr/bin/host file; then
+    dc_pkg_dnsclient="$dc_provider_answer"
+    dc_fact "the package that carries host(1)" "$dc_pkg_dnsclient" "$dc_provider_how"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# dc seed: the pre-provision state, which is the operator's half
+# ---------------------------------------------------------------------------
+# The Fedora guest gets this state from cloud-init, which installs samba and
+# samba-tools and deliberately stops there. The other two guests get no samba
+# at all from their seed, so this is where they are brought to the same state:
+# samba-tool present, the AD schema absent, no AD DC daemon. That is the state
+# the preflight's two conditions exist for, and a guest already past it proves
+# neither.
+#
+# It is a separate command from `dc test` on purpose. Installing packages is the
+# operator's half of this story — the tool states what is missing and never
+# installs it — and the snapshot that makes a failed provision retryable has to
+# be taken with the guest down, which a running flow cannot do.
+cmd_dc_seed() {
+  local vm="${1:-}" ; vm="${vm:-fedora}"
+  vm_running "$vm" || die "$vm is not running (lab.sh up $vm --mem 4096)"
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local logdir="$out/results/$stamp-dc-seed"
+  mkdir -p "$logdir"
+  rt_log="$logdir/seed.log"
+  rt_rc=0
+  echo "### dc seed on $vm — $(date -Is)" >"$rt_log"
+
+  dc_read_facts "$vm"
+
+  # The files database and the Contents index the provider queries need. Both
+  # are the package manager's own index of files it has not installed, and
+  # neither distribution ships one by default.
+  case "$dc_pm" in
+    apt) vm_install "$vm" apt-file || true
+         log "updating apt-file's Contents index (this is a large download)"
+         rt_run "$vm" "sudo -n apt-file update" >/dev/null || true ;;
+    pacman) log "syncing pacman's files database"
+         rt_run "$vm" "sudo -n pacman -Fy --noconfirm" >/dev/null || true ;;
+  esac
+
+  dc_read_packages "$vm"
+
+  # samba-tool itself, where the guest has none.
+  if [[ -z $dc_samba_version ]]; then
+    [[ -n $dc_pkg_sambatool ]] || die "cannot name the package that carries samba-tool on $vm"
+    log "installing $dc_pkg_sambatool, and the file server beside it"
+    dc_seed_samba "$vm"
+    dc_read_facts "$vm"
+    dc_read_packages "$vm"
+  fi
+
+  # Arch's samba package does not depend on python-cryptography, and without it
+  # every samba-tool subcommand dies building its own subcommand table. It is
+  # the guest's problem rather than the tool's, but a guest whose samba-tool
+  # cannot run is a guest that proves nothing, so the seed fixes it and the
+  # finding is recorded where the run can see it.
+  if ! rt_run "$vm" "sudo -n samba-tool --version" >/dev/null 2>&1; then
+    rt_say "NOTE  [$dc_where] samba-tool does not run on this guest as installed"
+    if [[ $dc_pm == pacman ]]; then
+      log "installing python-cryptography, which Arch's samba package does not depend on"
+      rt_run "$vm" "sudo -n pacman -S --needed --noconfirm python-cryptography" >/dev/null || true
+    fi
+    local ok=1
+    rt_run "$vm" "sudo -n samba-tool --version" >/dev/null 2>&1 && ok=0
+    dc_verdict "samba-tool runs on this guest after the seed" "$ok"
+  fi
+
+  dc_seed_hide_schema "$vm"
+
+  dc_read_facts "$vm"
+  local ok=1
+  [[ -n $dc_samba_version ]] && ok=0
+  dc_verdict "samba-tool is installed, which is what makes the wizard reachable" "$ok"
+  ok=1; [[ $dc_schema == absent ]] && ok=0
+  dc_verdict "the AD schema is absent, which is the state the preflight exists for" "$ok"
+
+  # Whether the AD DC unit file is here already is a fact about the
+  # distribution, not a condition of the seed. Fedora splits the AD DC daemon
+  # into a package of its own, so there is no unit file until it is installed;
+  # Debian and Arch ship the unit in the same package as the file server, so a
+  # guest with samba at all already has it. Either state is a correct
+  # pre-provision state — what the preflight is about is the schema.
+  if [[ $dc_unit == none ]]; then
+    rt_say "NOTE  [$dc_where] no AD DC unit file yet: this distribution splits the daemon out,"
+    rt_say "      so the run gets to watch the packages bring one."
+  else
+    rt_say "NOTE  [$dc_where] $dc_unit is already on disk: this distribution ships the AD DC"
+    rt_say "      unit in the same package as the file server, so installing samba brought it."
+  fi
+
+  echo
+  rt_say "The guest is in the pre-provision state. Take the snapshot a failed run restores:"
+  rt_say "  ./lab.sh down $vm && ./lab.sh snapshot $vm pre-dc && ./lab.sh up $vm --mem 4096"
+  log "evidence: $rt_log"
+  return $rt_rc
+}
+
+# dc_seed_samba installs what a user installs when they set out to serve a
+# domain and get as far as samba-tool: the file server and the tools, and
+# nothing that carries the AD schema.
+#
+# On Debian that means --no-install-recommends, and the reason is worth writing
+# down: `apt install samba` recommends samba-ad-provision, so the default
+# install on Ubuntu arrives with the AD schema already there and the preflight's
+# second condition never appears. The lab wants the state where it does, which
+# is also a real state — a server installed with recommends off, or a host that
+# only ever wanted samba-tool.
+dc_seed_samba() {
+  local vm="$1"
+  case "$dc_pm" in
+    dnf) rt_run "$vm" "sudo -n dnf -y -q install samba samba-tools" >/dev/null ;;
+    apt) rt_run "$vm" "sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+           --no-install-recommends samba $dc_pkg_sambatool" >/dev/null ;;
+    pacman) rt_run "$vm" "sudo -n pacman -S --needed --noconfirm $dc_pkg_sambatool" >/dev/null ;;
+  esac
+}
+
+# dc_seed_hide_schema parks the AD schema where the distribution ships it in the
+# same package as samba-tool.
+#
+# On Arch both come from `samba`, so a guest with a working samba-tool always
+# has the schema and the preflight's second condition cannot happen there at
+# all. That is itself a fact about the distribution, and it is recorded as one —
+# but it would also leave the one screen this family has no other way to see
+# unseen on Arch: what the tool says when it does not know which package carries
+# the schema. So the lab constructs the state, by moving the directory aside and
+# nothing else. `dc test` moves it back where it found it, in the step where the
+# other guests install a package.
+dc_seed_hide_schema() {
+  local vm="$1"
+  ((dc_schema_one_package)) || return 0
+  [[ $dc_schema == present ]] || return 0
+  rt_say "NOTE  [$dc_where] $dc_pkg_schema carries both samba-tool and the AD schema, so the"
+  rt_say "      schema-missing condition cannot occur here on its own: the lab moves the"
+  rt_say "      directory to $dc_schema_aside to see what the tool says about it."
+  rt_run "$vm" "sudo -n rm -rf $dc_schema_aside && sudo -n mv $dc_schema_dir $dc_schema_aside" >/dev/null \
+    || die "could not move $dc_schema_dir aside on $vm"
+}
 
 # dc_norm flattens a captured pane into one line of single-spaced text. The
 # confirm dialog wraps a long command line with an indented continuation, so an
@@ -3063,13 +3507,32 @@ dc_screen() {
 dc_has() {
   local text="$1" needle="$2" label="$3" ok=1
   [[ $text == *"$needle"* ]] && ok=0
-  rt_verdict "$label" "$ok"
+  dc_verdict "$label" "$ok"
 }
 
 dc_lacks() {
   local text="$1" needle="$2" label="$3" ok=0
   [[ $text == *"$needle"* ]] && ok=1
-  rt_verdict "$label" "$ok"
+  dc_verdict "$label" "$ok"
+}
+
+# dc_quote records the lines of the current screen that contain a phrase, word
+# for word, in a file of their own.
+#
+# It is here for the one thing this matrix exists to produce that is not a
+# PASS/FAIL row: where tui-dc does not know a distribution's package name, the
+# screen it shows instead is what someone has to read and then fix, and a
+# paraphrase of it is no use. The verbatim lines go beside the panes.
+dc_quote() {
+  local name="$1" needle="$2" file pane=""
+  file="$tui_shots/../quoted-$name.txt"
+  pane="$(tui_pane)" || pane=""
+  printf '%s\n' "$pane" | sed 's/│//g; s/^ *//; s/ *$//' \
+    | awk -v n="$needle" 'index($0, n) { found = 1 }
+        found && /^[╰─╯]+$/ { found = 0 }
+        found && NF' >"$file"
+  rt_say "QUOTE [$dc_where] what the screen said, verbatim, in $(basename "$file"):"
+  sed 's/^/        | /' "$file" | while IFS= read -r line; do rt_say "$line"; done
 }
 
 # dc_json reads one fact out of the tool's own --check JSON. The expression is
@@ -3121,8 +3584,11 @@ dc_confirm() {
 dc_fixture_up() {
   local vm="$1" hold body
   # A DNS client for the zone assertions at the end of the run. It belongs to
-  # the lab, not to the tool, so it goes in with the fixture.
-  vm_install "$vm" bind-utils || true
+  # the lab, not to the tool, so it goes in with the fixture — under the name
+  # this guest's package manager gave for host(1), which is a different name on
+  # each of the three.
+  rt_run "$vm" "command -v host" >/dev/null 2>&1 \
+    || { [[ -z $dc_pkg_dnsclient ]] || vm_install "$vm" "$dc_pkg_dnsclient" || true; }
   rt_run "$vm" "sudo -n modprobe dummy 2>/dev/null || true
     sudo -n ip link add $dc_fixture_if type dummy 2>/dev/null || true
     sudo -n ip addr replace $dc_fixture_ip/24 dev $dc_fixture_if
@@ -3153,6 +3619,118 @@ dc_fixture_down() {
     sudo -n ip link del $dc_fixture_if 2>/dev/null || true" >/dev/null 2>&1 || true
 }
 
+# dc_dc_extras names what else an AD DC needs on this distribution: packages the
+# distribution does not pull in with samba, and that a provision only discovers
+# by dying in the middle of writing the directory.
+#
+# Every entry here was found by a run in this lab, and the failure it prevents is
+# written beside it, because a list of package names with no reasons beside them
+# is a list nobody can maintain:
+#
+#   * Debian and Ubuntu need three packages that `samba` only *recommends*, so a
+#     default `apt install samba` has them and the install with recommends off —
+#     which is how this lab reaches the state the preflight's second condition is
+#     about — does not. Each was found by a provision that died on it:
+#       - samba-dsdb-modules carries the ldb modules provision writes the
+#         directory through. Without it provision reaches secrets.ldb, says
+#         "Module [samba_secrets] not found", and then dies on "'NoneType'
+#         object has no attribute 'startswith'".
+#         (apt-file -l -x search 'samba/ldb/samba_secrets.so$')
+#       - samba-vfs-modules carries acl_xattr, which provision loads through an
+#         in-process smbd to put the ACL on sysvol. Without it the transcript
+#         says "Error loading module …/vfs/acl_xattr.so", then
+#         "create_conn_struct: smbd_vfs_init failed".
+#         (apt-file -l -x search 'samba/vfs/acl_xattr.so$')
+#       - python3-markdown is what samba's forest update imports.
+#     And one that `samba` does not even recommend, only *suggest*, so no
+#     default install has it either:
+#       - winbind carries /usr/sbin/winbindd, which the AD DC forks. Without it
+#         the unit starts and dies in the same second, and the journal says
+#         "/usr/sbin/winbindd: Failed to exec child - No such file or directory",
+#         then "winbindd daemon died with exit status 255", then
+#         "samba_terminate: … winbindd child process exited". Which makes a
+#         stock `apt install samba` + provision + `systemctl enable --now
+#         samba-ad-dc.service` a sequence that cannot work on Ubuntu 24.04.
+#   * Arch needs python-markdown, which its samba package does not depend on.
+#     Provision gets as far as "Fixing provision GUIDs" and dies in
+#     forest_update.py on "No module named 'markdown'". (It needs
+#     python-cryptography too, without which no samba-tool subcommand runs at
+#     all; that one is installed by `dc seed`, because a guest whose samba-tool
+#     cannot start never reaches this flow.)
+#
+# None of this is tui-dc's to fix and none of it is hidden: the run records what
+# it installed, and a provision that failed for one of these reasons is exactly
+# what the tool's own failed-provision screen is for.
+dc_dc_extras() {
+  case "$dc_pm" in
+    apt) printf '%s\n' samba-dsdb-modules samba-vfs-modules python3-markdown winbind ;;
+    pacman) printf '%s\n' python-markdown ;;
+  esac
+}
+
+# dc_quiesce_file_server stops the standalone file-server units, because an AD DC
+# cannot run beside them.
+#
+# `samba` in AD DC mode forks its own smbd and winbindd. A standalone smbd
+# already holding 139 and 445 makes that fork die, and the unit with it: on
+# Ubuntu the journal says "samba_terminate: … smbd child process exited" and
+# nothing about a port. Debian and Ubuntu enable smbd and nmbd when the samba
+# package is installed, so that is the default state there and this step is not
+# optional; Fedora and Arch enable nothing, so it is a no-op on those and the
+# run says so.
+#
+# It is the operator's half like the packages are — and it is also a gap in what
+# the tool says, because the one command its result screen offers cannot work on
+# a Debian host until this has happened. The run records which units it found
+# running, so that claim is evidence rather than an opinion.
+dc_quiesce_file_server() {
+  local vm="$1" unit found="" ok=0
+  for unit in smbd nmbd smb nmb winbind; do
+    if [[ "$(rt_run "$vm" "systemctl is-active $unit.service 2>/dev/null || true")" == active ]]; then
+      found="$found $unit"
+    fi
+  done
+  if [[ -z $found ]]; then
+    rt_say "NOTE  [$dc_where] no standalone file-server unit is running here, so nothing to stop"
+    return 0
+  fi
+  rt_say "NOTE  [$dc_where] the distribution left these running, and an AD DC cannot start"
+  rt_say "      beside them:$found — stopping them, outside the tool"
+  # $found is a space-separated list this function built itself, so the word
+  # splitting here is the intent rather than an accident.
+  # shellcheck disable=SC2086
+  rt_run "$vm" "sudo -n systemctl disable --now $found 2>&1 || true" >/dev/null || true
+  for unit in $found; do
+    [[ "$(rt_run "$vm" "systemctl is-active $unit.service 2>/dev/null || true")" == active ]] && ok=1
+  done
+  dc_verdict "the standalone file server is stopped, so the AD DC can claim its ports" "$ok"
+}
+
+# dc_install_dc_packages is the operator's half: the AD schema and the AD DC
+# daemon, by the names this guest's own package manager gave for the files that
+# carry them, rather than by the names the tool printed. The difference matters
+# on two of the three guests, because on those two the tool printed no name at
+# all — which is exactly the gap this run is here to document.
+dc_install_dc_packages() {
+  local vm="$1" ok=0 names=()
+  if ((dc_schema_one_package)) && rt_run "$vm" "test -d $dc_schema_aside" >/dev/null 2>&1; then
+    log "putting the AD schema back where the lab found it"
+    rt_run "$vm" "sudo -n mv $dc_schema_aside $dc_schema_dir" >/dev/null || ok=1
+    dc_verdict "the AD schema is back in place, the way installing $dc_pkg_schema would leave it" "$ok"
+  fi
+  [[ -z $dc_pkg_schema ]] || names+=("$dc_pkg_schema")
+  [[ -z $dc_pkg_unit || $dc_pkg_unit == "$dc_pkg_schema" ]] || names+=("$dc_pkg_unit")
+  local extra
+  while IFS= read -r extra; do
+    [[ -z $extra ]] || names+=("$extra")
+  done < <(dc_dc_extras)
+  ((${#names[@]})) || return 0
+  log "installing ${names[*]} (outside the tool)"
+  ok=0
+  vm_install "$vm" "${names[@]}" || ok=1
+  dc_verdict "the AD DC packages install on this guest: ${names[*]}" "$ok"
+}
+
 cmd_dc_test() {
   local vm="" bin=""
   while (($#)); do
@@ -3170,7 +3748,7 @@ cmd_dc_test() {
   bin="$tool_bin"
 
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
-  local logdir="$out/results/$stamp-dc"
+  local logdir="$out/results/$stamp-dc-$vm"
   tui_shots="$logdir/panes"
   mkdir -p "$tui_shots"
   rt_log="$logdir/dc.log"
@@ -3179,20 +3757,37 @@ cmd_dc_test() {
   tui_shot_n=0
   tui_session="tui-dc-drive"
 
-  local iface name check body preview password ok
-  iface="$(rt_run "$vm" "ip -o -4 route show default | awk '{print \$5; exit}'")" || true
-  iface="${iface//[[:space:]]/}"
-  name="$(rt_run "$vm" "hostname -s")" || true
-  name="$(printf '%s' "${name//[[:space:]]/}" | tr '[:upper:]' '[:lower:]')"
+  local name check body preview password ok
+  echo "### the provision wizard on $vm, driven through tui-dc — $(date -Is)" >"$rt_log"
+  # What the distribution shipped, kept apart from what is on disk later: the
+  # facts are re-read after the tool has moved smb.conf aside and after the
+  # packages are in, and "does this distribution ship an smb.conf" must still
+  # mean what it meant before the run touched anything.
+  local shipped_smbconf=""
+
+  # -- 0. what is true on this guest --------------------------------------
+  # Read first, asserted against afterwards. Everything below that used to be
+  # Fedora's answer written into a string comparison is one of these.
+  log "reading what is true on $vm"
+  dc_read_facts "$vm"
+  dc_read_packages "$vm"
+  name="$(rt_run "$vm" "uname -n")" || true
+  name="$(printf '%s' "${name//[[:space:]]/}" | cut -d. -f1 | tr '[:upper:]' '[:lower:]')"
   local dc_name="$name.$dc_realm"
   {
-    echo "### the provision wizard on $vm, driven through tui-dc — $(date -Is)"
-    echo "guest: $dc_guest_ip on $iface, forwarder $dc_forwarder"
+    echo "guest: $dc_guest_ip on $dc_iface, forwarder $dc_forwarder"
     echo "fixture: $dc_fixture_ip on $dc_fixture_if, with a process on its port 53"
     echo "realm: $dc_realm, controller: $dc_name"
     echo "binary: $bin"
-  } >"$rt_log"
-  [[ -n $iface ]] || die "could not read the guest's default-route interface"
+  } >>"$rt_log"
+
+  shipped_smbconf="$dc_smbconf"
+  ok=1; [[ -n $dc_samba_version ]] && ok=0
+  dc_verdict "the guest is in the pre-provision state: samba-tool is installed" "$ok"
+  ((ok == 0)) || { rt_say "Run ./lab.sh dc seed $vm first."; return 1; }
+  ok=1; [[ $dc_schema == absent ]] && ok=0
+  dc_verdict "and the AD schema is not — the state the preflight's second condition is about" "$ok"
+  ((ok == 0)) || { rt_say "Run ./lab.sh dc seed $vm first."; return 1; }
 
   # -- 1. a multi-homed guest, before the tool is started -------------------
   log "making $vm multi-homed, with DNS already held on $dc_fixture_ip"
@@ -3204,75 +3799,125 @@ cmd_dc_test() {
   vm_ssh "$vm" "chmod +x $dc_bin_path"
   rt_run "$vm" "$dc_bin_path --version" >/dev/null
 
-  # -- 2. the preflight names both refusals --------------------------------
-  # Both used to be discovered after the realm had been typed twice and the
-  # command confirmed, one of them a minute into a provision that then died in a
-  # Python traceback. So the first thing to prove is that neither costs a wizard
-  # run any more.
+  # -- 2. the preflight names what stops provisioning here ------------------
+  # Both conditions used to be discovered after the realm had been typed twice
+  # and the command confirmed, one of them a minute into a provision that then
+  # died in a Python traceback. So the first thing to prove is that neither
+  # costs a wizard run any more — and that the screen names the conditions this
+  # guest actually has, rather than Fedora's two.
   tui_start "$vm" "TERM=xterm-256color $dc_bin_path"
   dc_ready 90 || { tui_stop; return 1; }
   tui_shot "first-frame"
+  body="$(dc_screen)"
+  dc_has "$body" "samba $dc_samba_numeric" \
+    "the header reports the samba this guest has, $dc_samba_numeric"
+
   tui_keys P
   tui_wait_for "Provisioning cannot start" 20 || { tui_stop; return 1; }
-  tui_shot "preflight-both-conditions"
+  tui_shot "preflight"
   body="$(dc_screen)"
-  dc_has "$body" "/etc/samba/smb.conf configures this host as" \
-    "the preflight names the distribution's smb.conf standing in the way"
-  dc_has "$body" "provision will not start beside it" \
-    "it says why: provision refuses unless the resolved server role is the DC one"
-  dc_has "$body" "the AD provisioning data is not installed" \
-    "the preflight names the missing AD provisioning data"
-  dc_has "$body" "samba-dc-provision" \
-    "and the Fedora package that carries it, samba-dc-provision"
   dc_lacks "$body" "Provision 1/6" \
     "the preflight stopped the wizard before its first question"
 
-  # -- 3. the offered fix runs ---------------------------------------------
-  # The one condition the tool can clear, cleared through the tool's own
-  # previewed confirm rather than in a shell.
-  tui_keys Enter
-  tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
-  preview="$(dc_screen)"
-  dc_has "$preview" "mv /etc/samba/smb.conf /etc/samba/smb.conf.orig" \
-    "the fix it offers is the previewed mv of the distribution's smb.conf"
-  dc_confirm "smbconf-move" "done: Move /etc/samba/smb.conf aside" 60 || { tui_stop; return 1; }
+  # Condition one is the distribution's own smb.conf, and whether it is there at
+  # all is a fact about the distribution. Arch ships none, so on that guest the
+  # condition must not appear — asserting Fedora's screen there would be
+  # asserting that Arch ships a file it does not.
+  if [[ $dc_smbconf == present ]]; then
+    dc_has "$body" "/etc/samba/smb.conf configures this host as" \
+      "the preflight names the distribution's smb.conf standing in the way"
+    dc_has "$body" "provision will not start beside it" \
+      "it says why: provision refuses unless the resolved server role is the DC one"
+  else
+    dc_lacks "$body" "/etc/samba/smb.conf configures this host as" \
+      "this distribution ships no smb.conf, and the preflight does not invent one"
+  fi
 
-  ok=0
-  rt_run "$vm" "test ! -e /etc/samba/smb.conf && test -f /etc/samba/smb.conf.orig" >/dev/null || ok=1
-  rt_verdict "on the guest, the file moved: smb.conf gone, smb.conf.orig in its place" "$ok"
-
-  # The preflight again: the condition the tool cleared is gone and the one it
-  # cannot is still there, which is the difference between a fix and a message.
-  tui_keys Escape
-  dc_ready 60 || { tui_stop; return 1; }
-  tui_keys P
-  tui_wait_for "Provisioning cannot start" 20 || { tui_stop; return 1; }
-  tui_shot "preflight-package-only"
-  body="$(dc_screen)"
-  dc_lacks "$body" "/etc/samba/smb.conf configures this host as" \
-    "re-opened, the preflight no longer names the smb.conf it moved"
+  # Condition two is the AD schema, absent on every guest by now — but what the
+  # screen says about it is not the same text everywhere, because the tool only
+  # knows the package name on Fedora and its relatives.
   dc_has "$body" "the AD provisioning data is not installed" \
-    "and still names the package condition, which is the operator's to clear"
+    "the preflight names the missing AD provisioning data"
+  case "$dc_id" in
+    fedora|rhel|centos)
+      dc_has "$body" "samba-dc-provision" \
+        "and the Fedora package that carries it, samba-dc-provision"
+      ok=1; [[ $dc_pkg_schema == samba-dc-provision ]] && ok=0
+      dc_verdict "which is the name dnf gives for $dc_schema_dir too" "$ok"
+      ;;
+    *)
+      # The gap. The tool says it does not know, and it is right that it does
+      # not guess — but a reader on this distribution is left with nothing, and
+      # what the package is actually called here is something this run knows.
+      dc_has "$body" "This tool does not know which package carries it on" \
+        "the tool says it does not know this distribution's package rather than guessing one"
+      dc_has "$body" "$dc_pretty" \
+        "and names the distribution it is talking about, $dc_pretty"
+      dc_quote "preflight-unknown-package-$dc_id" "This tool does not know"
+      rt_say "GAP   [$dc_where] the package tui-dc could name here is $dc_pkg_schema,"
+      rt_say "      which carries $dc_schema_dir. Found with: $dc_how_schema"
+      rt_say "      The AD DC unit ($dc_unit_expected) comes from $dc_pkg_unit."
+      rt_say "      Found with: $dc_how_unit"
+      ;;
+  esac
+
+  # -- 3. the offered fix runs, where there is one to offer -----------------
+  # The one condition the tool can clear, cleared through the tool's own
+  # previewed confirm rather than in a shell. On a guest with no smb.conf there
+  # is nothing to offer, and the screen has to say so instead of offering it.
+  if [[ $dc_smbconf == present ]]; then
+    tui_keys Enter
+    tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
+    preview="$(dc_screen)"
+    dc_has "$preview" "mv /etc/samba/smb.conf /etc/samba/smb.conf.orig" \
+      "the fix it offers is the previewed mv of the distribution's smb.conf"
+    dc_confirm "smbconf-move" "done: Move /etc/samba/smb.conf aside" 60 || { tui_stop; return 1; }
+
+    ok=0
+    rt_run "$vm" "test ! -e /etc/samba/smb.conf && test -f /etc/samba/smb.conf.orig" >/dev/null || ok=1
+    dc_verdict "on the guest, the file moved: smb.conf gone, smb.conf.orig in its place" "$ok"
+
+    # The preflight again: the condition the tool cleared is gone and the one it
+    # cannot is still there, which is the difference between a fix and a message.
+    tui_keys Escape
+    dc_ready 60 || { tui_stop; return 1; }
+    tui_keys P
+    tui_wait_for "Provisioning cannot start" 20 || { tui_stop; return 1; }
+    tui_shot "preflight-package-only"
+    body="$(dc_screen)"
+    dc_lacks "$body" "/etc/samba/smb.conf configures this host as" \
+      "re-opened, the preflight no longer names the smb.conf it moved"
+    dc_has "$body" "the AD provisioning data is not installed" \
+      "and still names the package condition, which is the operator's to clear"
+  fi
   dc_has "$body" "There is nothing for this tool to run here" \
     "with nothing left to offer, it says so instead of offering a command"
   tui_keys Escape
   tui_stop
 
-  # -- 4. the package is the operator's job --------------------------------
-  # Outside the tool, which is the point: the tool states the packages and does
-  # not install them. dnf by name rather than through vm_install because this
-  # flow is Fedora's and these are the two package names the condition printed.
-  log "installing the DC packages the tool named (outside the tool)"
-  ok=0
-  rt_run "$vm" "sudo -n dnf -y -q install samba-dc-provision samba-dc" >/dev/null || ok=1
-  rt_verdict "the packages the preflight named install on the guest" "$ok"
+  # -- 4. the packages are the operator's job ------------------------------
+  # Outside the tool, which is the point: the tool states what is missing and
+  # does not install it. By the names this guest's package manager gave, because
+  # on two of the three guests the tool gave none.
+  dc_install_dc_packages "$vm"
+
+  dc_quiesce_file_server "$vm"
+
+  # The unit file those packages brought, and the name the tool will have to
+  # detect. DetectDCUnit stats the file rather than mapping a distribution to a
+  # name, and this is the reading that says what it will find here.
+  dc_read_facts "$vm"
+  ok=1; [[ $dc_unit != none ]] && ok=0
+  dc_verdict "the packages brought an AD DC unit file: $dc_unit" "$ok"
+  ok=1; [[ -z $dc_unit_expected || $dc_unit == "$dc_unit_expected" ]] && ok=0
+  dc_verdict "the unit on disk is the one the package index named ($dc_unit_expected)" "$ok"
 
   tui_start "$vm" "TERM=xterm-256color $dc_bin_path"
   dc_ready 90 || { tui_stop; return 1; }
   tui_keys P
   ok=1; tui_wait_for "Provision 1/6" 20 && ok=0
   tui_shot "wizard-realm"
-  rt_verdict "with the packages in place the preflight is clean and the wizard opens" "$ok"
+  dc_verdict "with the packages in place the preflight is clean and the wizard opens" "$ok"
   ((ok == 0)) || { tui_stop; return 1; }
 
   # -- 5. the wizard, end to end -------------------------------------------
@@ -3298,11 +3943,11 @@ cmd_dc_test() {
   tui_wait_for "Provision 5/6" 20 || { tui_stop; return 1; }
   tui_shot "wizard-address-picker"
   body="$(dc_screen)"
-  dc_has "$body" "$dc_guest_ip on $iface" \
-    "the address picker lists the guest's real address, $dc_guest_ip on $iface"
+  dc_has "$body" "$dc_guest_ip on $dc_iface" \
+    "the address picker lists the guest's real address, $dc_guest_ip on $dc_iface"
   dc_has "$body" "$dc_fixture_ip on $dc_fixture_if" \
     "and the fixture address, $dc_fixture_ip on $dc_fixture_if"
-  dc_has "$body" "> $dc_guest_ip on $iface" \
+  dc_has "$body" "> $dc_guest_ip on $dc_iface" \
     "the address on the default route is the preselected one, not whichever came first"
   # Accepted as it stands: the preselection is the answer under test.
   tui_keys Enter
@@ -3327,8 +3972,8 @@ cmd_dc_test() {
     "the chosen address is --host-ip=$dc_guest_ip, so the A record is not a guess"
   dc_has "$preview" "'--option=dns forwarder=$dc_forwarder'" \
     "the forwarder travels as the quoted smb.conf option 'dns forwarder=$dc_forwarder'"
-  dc_has "$preview" "'--option=interfaces=lo $iface'" \
-    "the chosen address implies 'interfaces=lo $iface' — the DC is bound, not spread"
+  dc_has "$preview" "'--option=interfaces=lo $dc_iface'" \
+    "the chosen address implies 'interfaces=lo $dc_iface' — the DC is bound, not spread"
   dc_has "$preview" "'--option=bind interfaces only=yes'" \
     "and 'bind interfaces only=yes', which is what keeps the held port 53 out of its way"
 
@@ -3349,9 +3994,9 @@ cmd_dc_test() {
     awk '/Administrator password/ { found = 1; next }
          found && NF && !got { print; got = 1 }')"
   ok=1; [[ -n ${password//[[:space:]]/} ]] && ok=0
-  rt_verdict "the result screen carries the Administrator password samba-tool printed once" "$ok"
+  dc_verdict "the result screen carries the Administrator password samba-tool printed once" "$ok"
   ok=1; [[ $(printf '%s' "$password" | wc -w) -eq 1 ]] && ok=0
-  rt_verdict "the password line is one token — nothing of it was split or swallowed" "$ok"
+  dc_verdict "the password line is one token — nothing of it was split or swallowed" "$ok"
   # From here on every capture of this screen carries the password, so it is
   # scrubbed at the source rather than at each caller.
   tui_secret="${password//[[:space:]]/}"
@@ -3369,55 +4014,93 @@ cmd_dc_test() {
   # than asserted: a run that demanded the warning block be present would be
   # demanding that something had gone wrong.
   if [[ $body == *"What provision warned about"* ]]; then
-    rt_say "NOTE  this provision printed WARNING lines, and the screen shows them"
+    rt_say "NOTE  [$dc_where] this provision printed WARNING lines, and the screen shows them"
   else
-    rt_say "NOTE  this provision printed no WARNING line, so there is no warning block"
+    rt_say "NOTE  [$dc_where] this provision printed no WARNING line, so there is no warning block"
   fi
 
   # -- 8. the ordered follow-ups -------------------------------------------
-  # The order is the finding. On Fedora samba runs the MIT KDC, the KDC reads
-  # /etc/krb5.conf, and Fedora ships that file with no default_realm — so the
-  # unit the tool used to offer first died with nothing in the journal but
-  # "mitkdc child process exited". The Kerberos drop-in has to come first.
-  tui_keys Enter
-  tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
-  preview="$(dc_screen)"
-  dc_has "$preview" "install -m 644 /var/lib/samba/private/krb5.conf /etc/krb5.conf.d/samba-dc.conf" \
-    "the first step offered is the Kerberos drop-in, previewed as one install command"
-  dc_lacks "$preview" "systemctl enable" \
-    "the unit is not what the first step starts — the order the MIT KDC requires"
-  dc_confirm "krb5-dropin" "done: Install the generated Kerberos" 60 || { tui_stop; return 1; }
+  # Whether there are two steps or one is a fact about this build of samba.
+  #
+  # Where samba runs the MIT KDC, the KDC reads /etc/krb5.conf, and a
+  # distribution that ships that file with no default_realm makes the unit die
+  # with nothing in the journal but "mitkdc child process exited" — so the
+  # Kerberos drop-in has to come first, and the order is the finding. Where
+  # samba carries its own Heimdal, or where there is no /etc/krb5.conf.d to drop
+  # into, or where /etc/krb5.conf already names a realm somebody chose, the tool
+  # offers no drop-in at all and the screen has to say what to do instead.
+  local expect_dropin=0
+  [[ $dc_krb5_dir == present && $dc_krb5_realm != named ]] && expect_dropin=1
+  rt_say "NOTE  [$dc_where] krb5.conf.d $dc_krb5_dir, default_realm $dc_krb5_realm, KDC $dc_kdc"
+  rt_say "      so the Kerberos drop-in step is $( ((expect_dropin)) && echo "expected" || echo "not expected") here"
+  if ((expect_dropin)); then
+    tui_keys Enter
+    tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
+    preview="$(dc_screen)"
+    dc_has "$preview" "install -m 644 /var/lib/samba/private/krb5.conf /etc/krb5.conf.d/samba-dc.conf" \
+      "the first step offered is the Kerberos drop-in, previewed as one install command"
+    dc_lacks "$preview" "systemctl enable" \
+      "the unit is not what the first step starts — the order the MIT KDC requires"
+    dc_confirm "krb5-dropin" "done: Install the generated Kerberos" 60 || { tui_stop; return 1; }
+    ok=0
+    rt_run "$vm" "test -f /etc/krb5.conf.d/samba-dc.conf" >/dev/null || ok=1
+    dc_verdict "on the guest, /etc/krb5.conf.d/samba-dc.conf is in place" "$ok"
+  else
+    dc_lacks "$body" "/etc/krb5.conf.d — so it drops" \
+      "with no include directory to drop into, the tool offers no Kerberos drop-in"
+    dc_has "$body" "merge it into /etc/krb5.conf (do not symlink it)" \
+      "it says what to do with the generated file instead, and warns against a symlink"
+    if [[ $dc_kdc == MIT ]]; then
+      rt_say "NOTE  [$dc_where] this build runs the MIT KDC and there is no drop-in step here:"
+      rt_say "      the unit below is started without a default_realm in place, and whether"
+      rt_say "      it survives that is the next assertion rather than an assumption."
+    fi
+  fi
 
+  # The unit, whichever one this distribution has.
   tui_keys Enter
   tui_wait_for "Command to run:" 20 || { tui_stop; return 1; }
   preview="$(dc_screen)"
   dc_has "$preview" "systemctl enable --now $dc_unit" \
-    "the second step is the unit, now that the KDC has a realm to read"
+    "the unit step names $dc_unit — what DetectDCUnit found on this distribution's disk"
   dc_confirm "enable-unit" "done: Enable and start" 180 || { tui_stop; return 1; }
 
-  ok=0
-  rt_run "$vm" "test -f /etc/krb5.conf.d/samba-dc.conf" >/dev/null || ok=1
-  rt_verdict "on the guest, /etc/krb5.conf.d/samba-dc.conf is in place" "$ok"
   ok=1
   [[ "$(rt_run "$vm" "systemctl is-active $dc_unit" || true)" == active ]] && ok=0
-  rt_verdict "on the guest, $dc_unit is active — the unit that used to exit on the MIT KDC" "$ok"
+  dc_verdict "on the guest, $dc_unit is active — the controller is serving" "$ok"
+  ((ok == 0)) || rt_run "$vm" "sudo -n journalctl -u $dc_unit --no-pager -n 40" >/dev/null || true
   tui_stop
 
   # -- 9. the domain answers -----------------------------------------------
   # The tool's own read path against the controller it just created, and then
   # the two questions a domain member would ask it.
-  check="$(rt_run "$vm" "sudo -n $dc_bin_path --check")" || true
+  #
+  # The read is polled rather than taken once, because `systemctl is-active`
+  # going green and the controller answering DRS are not the same moment: the
+  # unit is active as soon as samba has forked, and `drs showrepl -P` needs the
+  # DRS endpoint registered and the machine account usable. Read immediately,
+  # Ubuntu's 4.19.5 reported no replication and Fedora's 4.24.6 did — a
+  # difference in start-up time asserted as a difference in the tool. How long
+  # it actually took is recorded, because that is the interesting part.
+  local waited=0
+  for ((waited = 0; waited < 120; waited += 5)); do
+    check="$(rt_run "$vm" "sudo -n $dc_bin_path --check")" || true
+    [[ "$(dc_json "$check" 'd.get("replicationRead")')" == 0 ]] && break
+    sleep 5
+  done
+  rt_say "NOTE  [$dc_where] the controller answered the tool's read path after ${waited}s"
+  rt_say "      of waiting past the unit going active"
   printf '%s\n' "$check" >"$logdir/check.json"
   ok="$(dc_json "$check" 'd.get("isDomainController")')"
-  rt_verdict "tui-dc --check reads this host as a domain controller" "$ok"
+  dc_verdict "tui-dc --check reads this host as a domain controller" "$ok"
   ok="$(dc_json "$check" 'd.get("zoneRead")')"
-  rt_verdict "tui-dc --check read the domain's DNS zone" "$ok"
+  dc_verdict "tui-dc --check read the domain's DNS zone" "$ok"
   ok="$(dc_json "$check" 'd.get("dnsRecords", 0) > 0')"
-  rt_verdict "and found records in it" "$ok"
+  dc_verdict "and found records in it" "$ok"
   ok="$(dc_json "$check" 'd.get("replicationRead")')"
-  rt_verdict "tui-dc --check read replication from the controller" "$ok"
+  dc_verdict "tui-dc --check read replication from the controller" "$ok"
   ok="$(dc_json "$check" 'd.get("replicationOk")')"
-  rt_verdict "and reports it healthy on a single-DC domain" "$ok"
+  dc_verdict "and reports it healthy on a single-DC domain" "$ok"
 
   body="$(rt_run "$vm" "host -t A $dc_name $dc_guest_ip")" || true
   dc_has "$body" "has address $dc_guest_ip" \
@@ -3429,10 +4112,14 @@ cmd_dc_test() {
   dc_fixture_down "$vm"
 
   echo
+  rt_say "FACTS this run established on $dc_where:"
+  rt_say "  samba $dc_samba_version · samba-tool from $dc_pkg_sambatool · AD schema from $dc_pkg_schema"
+  rt_say "  AD DC unit $dc_unit from $dc_pkg_unit · Kerberos $dc_kdc"
+  rt_say "  ships /etc/samba/smb.conf: $shipped_smbconf · /etc/krb5.conf.d: $dc_krb5_dir · default_realm: $dc_krb5_realm"
   if ((rt_rc)); then
-    rt_say "VERDICT  the provision wizard on a real Fedora guest: FAIL"
+    rt_say "VERDICT  the provision wizard on $dc_where: FAIL"
   else
-    rt_say "VERDICT  the provision wizard on a real Fedora guest: PASS"
+    rt_say "VERDICT  the provision wizard on $dc_where: PASS"
   fi
   rt_say "The guest is left provisioned. Restore the snapshot before running this again:"
   rt_say "  ./lab.sh down $vm && ./lab.sh restore $vm pre-dc && ./lab.sh up $vm --mem 4096"
@@ -3444,8 +4131,9 @@ cmd_dc_test() {
 cmd_dc() {
   local sub="${1:-}"; shift || true
   case "$sub" in
+    seed) cmd_dc_seed "$@" ;;
     test) cmd_dc_test "$@" ;;
-    *) die "dc: expected test" ;;
+    *) die "dc: expected seed or test" ;;
   esac
 }
 
