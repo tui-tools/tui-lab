@@ -8,7 +8,7 @@
 # smoke test against the real backend.
 #
 # Usage:
-#   lab.sh up <ubuntu|fedora|omarchy> [--mem MB] [--cpus N] [--disk GB] [--selinux]
+#   lab.sh up <ubuntu|ubuntu26|fedora|omarchy> [--mem MB] [--cpus N] [--disk GB] [--selinux]
 #   lab.sh down <vm> | status [vm] | ssh <vm> [cmd...] | wait-ssh <vm> [secs]
 #   lab.sh snapshot <vm> <tag> | restore <vm> <tag>
 #   lab.sh all up | all down | all status
@@ -102,12 +102,23 @@ avell_scp() { scp -q "$1" "$libvirt_jump:$2"; }
 # releases and their digests are recorded in the README.
 
 fedora_release="44-1.7"
+
+# The permanent guests, in the order every command without a guest filter
+# visits them. `ubuntu` is 24.04 LTS (noble) and `ubuntu26` is 26.04 LTS
+# (resolute): two LTS releases side by side, because a tool that reads apt,
+# dpkg or systemd is exercised against both the release most servers run and
+# the one they are moving to. New guests are appended, so existing results
+# keep their column order.
+lab_guests=(ubuntu fedora omarchy ubuntu26)
 omarchy_release="image-2026-08-29"
 omarchy_date="2026-08-29"
 
 image_url() {
   case "$1" in
     ubuntu) echo "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img" ;;
+    # releases/26.04/release/ follows the newest point respin of 26.04 the way
+    # noble/current does for 24.04, and its SHA256SUMS sits beside it.
+    ubuntu26) echo "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img" ;;
     fedora) echo "https://dl.fedoraproject.org/pub/fedora/linux/releases/${fedora_release%%-*}/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-${fedora_release}.x86_64.qcow2" ;;
     omarchy) echo "https://github.com/edimarlnx/omarchy-server/releases/download/${omarchy_release}/omarchy-server-${omarchy_date}${omarchy_variant}-x86_64.qcow2" ;;
     *) die "unknown distro: $1" ;;
@@ -312,6 +323,12 @@ verify_image() {
         -o "$images/ubuntu-SHA256SUMS" || return 0
       want=$(awk '/noble-server-cloudimg-amd64.img$/ {print $1}' "$images/ubuntu-SHA256SUMS" | head -1)
       ;;
+    ubuntu26)
+      # The lines here carry sha256sum's binary marker: "<hash> *<file>".
+      curl -fsSL "https://cloud-images.ubuntu.com/releases/26.04/release/SHA256SUMS" \
+        -o "$images/ubuntu26-SHA256SUMS" || return 0
+      want=$(awk '/[ *]ubuntu-26.04-server-cloudimg-amd64.img$/ {print $1}' "$images/ubuntu26-SHA256SUMS" | head -1)
+      ;;
     fedora)
       curl -fsSL "https://dl.fedoraproject.org/pub/fedora/linux/releases/${fedora_release%%-*}/Cloud/x86_64/images/Fedora-Cloud-${fedora_release}-x86_64-CHECKSUM" \
         -o "$images/fedora-CHECKSUM" || return 0
@@ -331,7 +348,7 @@ verify_image() {
 
 cmd_images() {
   local distro
-  for distro in ubuntu fedora omarchy; do
+  for distro in "${lab_guests[@]}"; do
     local file; file="$(image_file "$distro")"
     if [[ -f $file ]]; then
       printf '%-8s %s  %s\n' "$distro" "$(sha256sum "$file" | cut -d' ' -f1)" "$(basename "$file")"
@@ -350,6 +367,8 @@ cmd_images() {
 #   ubuntu   ufw, enabled with 22 allowed first; snapper + a btrfs data disk,
 #            because the Ubuntu cloud image's own root is ext4 and snapper has
 #            nothing to snapshot without one.
+#   ubuntu26 the same payload as ubuntu, on 26.04: the two differ only in the
+#            release, so whatever differs in a result is the release's doing.
 #   fedora   firewalld is already installed and running; snapper + the same
 #            btrfs data disk, mounted with an SELinux context because Fedora
 #            Cloud is enforcing out of the box; policycoreutils so the SELinux
@@ -395,7 +414,7 @@ EOF
       router_seed_payload "$role"
     else
     case "$distro" in
-      ubuntu)
+      ubuntu|ubuntu26)
         cat <<'EOF'
 package_update: true
 packages:
@@ -653,7 +672,7 @@ cmd_down() {
 
 cmd_status() {
   local names=("$@")
-  ((${#names[@]})) || names=(ubuntu fedora omarchy)
+  ((${#names[@]})) || names=("${lab_guests[@]}")
   local name
   for name in "${names[@]}"; do
     if vm_running "$name"; then
@@ -727,7 +746,7 @@ cmd_test() {
       *) vms+=("$1"); shift ;;
     esac
   done
-  ((${#vms[@]})) || vms=(ubuntu fedora omarchy)
+  ((${#vms[@]})) || vms=("${lab_guests[@]}")
 
   build_tool "$tool" "$bin"
   bin="$tool_bin"
@@ -832,7 +851,7 @@ cmd_report() {
       *) vms+=("$1"); shift ;;
     esac
   done
-  ((${#vms[@]})) || vms=(ubuntu fedora omarchy)
+  ((${#vms[@]})) || vms=("${lab_guests[@]}")
 
   local tools=()
   if [[ $target == all ]]; then
@@ -4549,8 +4568,8 @@ case "$cmd" in
   all)
     sub="${1:?up|down|status}"; shift
     case "$sub" in
-      up) for d in ubuntu fedora omarchy; do cmd_up "$d" "$@"; done ;;
-      down) for d in ubuntu fedora omarchy; do cmd_down "$d"; done ;;
+      up) for d in "${lab_guests[@]}"; do cmd_up "$d" "$@"; done ;;
+      down) for d in "${lab_guests[@]}"; do cmd_down "$d"; done ;;
       status) cmd_status ;;
       *) die "all: expected up, down or status" ;;
     esac
