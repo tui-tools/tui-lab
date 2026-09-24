@@ -9,13 +9,16 @@ The tools in this family drive real system backends: `ufw`, `firewalld`, `system
 
 It is glue, so it is one bash script.
 
-## The three machines
+## The four machines
 
 | VM | Image | Firewall | Snapshots | Notes |
 |----|-------|----------|-----------|-------|
 | `ubuntu` | Ubuntu 24.04 LTS cloud image | `ufw`, enabled with 22 allowed | `snapper` on a btrfs data disk | **Root is ext4**, so snapper gets `/dev/vdb` |
 | `fedora` | Fedora Cloud Base Generic 44 | `firewalld`, installed by the seed | `snapper` on a btrfs data disk, mounted with an SELinux `context=` | **Root is btrfs**; SELinux **enforcing**; `cronie`, so the lab has one `crond.service` machine; `samba` + `samba-tools`, so the lab has one machine with a real `samba-tool` |
 | `omarchy` | [Omarchy Server](https://github.com/edimarlnx/omarchy-server) cloud image | `ufw`, already `limit 22/tcp` | `snapper` ships in the image | Root is btrfs; seeded with **nothing** |
+| `ubuntu26` | Ubuntu 26.04 LTS cloud image | `ufw`, enabled with 22 allowed | `snapper` on a btrfs data disk | The same seed as `ubuntu`, one LTS later: **root is ext4**; `sudo` is **sudo-rs** |
+
+`ubuntu26` joined after the other three, which is why it is the last column everywhere. It exists because servers are moving from 24.04 to 26.04 and the newer release carries different majors of the programs the tools read (apt 3.2, dpkg 1.23, systemd 259, where noble has apt 2.8, dpkg 1.22 and systemd 255); a tool whose parser is right on one and wrong on the other stays green on a lab that only has noble. It gets the Ubuntu seed unchanged, so a difference between the two Ubuntu columns is the release's doing and not the lab's.
 
 The Omarchy VM's **seed** installs no packages on purpose. The point of that machine is the image exactly as shipped; adding to it from cloud-init would stop testing the artifact. What a flow needs in order to exist at all it installs itself, at the point where installing it is the thing under test — `dc seed` puts samba on the Ubuntu and Omarchy guests for exactly that reason, with the guest's own package manager, and says so in its log.
 
@@ -26,8 +29,9 @@ The Omarchy VM's **seed** installs no packages on purpose. The point of that mac
 | Ubuntu 24.04.4 LTS | `noble-server-cloudimg-amd64.img` | **ext4** | `d0fe84bb5f80853425fa6be28e2c106f30104c3cfe8611933f2e65c9b63f0e30` |
 | Fedora Linux 44 (Cloud Edition) | `Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2` | **btrfs** | `28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f` |
 | Omarchy Server 4.0.1 | `omarchy-server-2026-08-29-x86_64.qcow2` | **btrfs** | `a2748ecc069ee328f56c30a8b813913d259332a181fe7aa3a8138b1b1bffc186` |
+| Ubuntu 26.04.1 LTS | `ubuntu-26.04-server-cloudimg-amd64.img` | **ext4** | `4908fb59ccd4e87ae4e8e973b7ef56f535448eacb24a87fd787270c0048987bc` |
 
-Each digest was checked against the checksum document the distro publishes beside the image, which `lab.sh fetch` does on every download. Ubuntu's `noble/current/` symlink moves with each daily respin, so its digest is verified against the `SHA256SUMS` published next to it rather than pinned in the script; Fedora and Omarchy are pinned releases.
+Each digest was checked against the checksum document the distro publishes beside the image, which `lab.sh fetch` does on every download. Ubuntu's `noble/current/` symlink moves with each daily respin, and `releases/26.04/release/` with each 26.04 point respin, so both digests are verified against the `SHA256SUMS` published next to them rather than pinned in the script; Fedora and Omarchy are pinned releases.
 
 Two things worth knowing before you assume otherwise, both found by building this lab:
 
@@ -51,7 +55,7 @@ sudo apt install qemu-system-x86 ovmf cloud-image-utils xorriso socat golang
 
 ### Resource footprint
 
-Each VM defaults to **2 GB RAM, 2 vCPUs, a 20 GB thin disk and a 4 GB data disk**. All three together need about **6 GB of RAM** while running. On disk after a full run: **4.5 GB of VM state** (ubuntu 2.3 GB, omarchy 1.4 GB, fedora 0.9 GB — thin qcow2, so far below the 20 GB they advertise) plus a **2.3 GB image cache** (Ubuntu 0.6 GB, Fedora 0.6 GB, Omarchy 1.2 GB). Call it **7 GB and 6 GB of RAM** for the full lab.
+Each VM defaults to **2 GB RAM, 2 vCPUs, a 20 GB thin disk and a 4 GB data disk**. All three together need about **6 GB of RAM** while running, and **8 GB** with `ubuntu26` as the fourth. On disk after a full run: **4.5 GB of VM state** (ubuntu 2.3 GB, omarchy 1.4 GB, fedora 0.9 GB — thin qcow2, so far below the 20 GB they advertise) plus a **2.3 GB image cache** (Ubuntu 0.6 GB, Fedora 0.6 GB, Omarchy 1.2 GB). Call it **7 GB and 6 GB of RAM** for the full lab.
 
 The Omarchy image declares a virtual size larger than the 20 GB default, so `--disk` only ever grows a disk and leaves that one at its own size.
 
@@ -60,16 +64,16 @@ A first `lab.sh all up` on a cold cache takes a few minutes, most of it download
 ## Using it
 
 ```bash
-./lab.sh all up                  # fetch, create and boot all three
+./lab.sh all up                  # fetch, create and boot all four
 ./lab.sh up fedora --mem 4096    # one VM, more memory
 ./lab.sh up omarchy --selinux    # the SELinux variant of the Omarchy image
 ./lab.sh status
 ./lab.sh ssh ubuntu              # interactive shell
 ./lab.sh ssh ubuntu 'ufw status' # one command
-./lab.sh test tui-firewall       # build, ship and test on all three
+./lab.sh test tui-firewall       # build, ship and test on all four
 ./lab.sh test tui-systemd fedora # one VM
 ./lab.sh test tui-snapper --bin /path/to/binary   # skip the build
-./lab.sh report tui-firewall     # check the --report block on all three
+./lab.sh report tui-firewall     # check the --report block on all four
 ./lab.sh report tui-secure fedora # one VM
 ./lab.sh report all              # every sibling tool checkout
 ./lab.sh dc seed omarchy         # put a guest in the pre-provision state tui-dc needs
@@ -289,25 +293,28 @@ done
 ./lab.sh all down
 ```
 
-| Tool | ubuntu | fedora | omarchy |
-|------|--------|--------|---------|
-| **tui-firewall** | version, demo frame, smoke **5/5** | version, demo frame, smoke **14/14** — see below | version, demo frame, smoke **5/5** |
-| **tui-systemd** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** |
-| **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **16/16** | version, demo frame, smoke **17/17** |
-| **tui-network** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** |
-| **tui-secure** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **22/22** |
-| **tui-users** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** |
-| **tui-ssh** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
-| **tui-disk** | version, demo frame, smoke **13/13** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** |
-| **tui-update** | version, demo frame, smoke **12/12** | version, demo frame, smoke **11/11** | version, demo frame, smoke **13/13** — see below |
-| **tui-logs** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** |
-| **tui-cron** | version, demo frame, smoke **18/18** | version, demo frame, smoke **18/18** | version, demo frame, smoke **19/19** — see below |
-| **tui-cert** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** |
-| **tui-samba** | version, demo frame, smoke **18/18** | version, demo frame, smoke **21/21** — see below | version, demo frame, smoke **18/18** |
-| **tui-containers** | version, demo frame, smoke **15/15** | version, demo frame, smoke **13/13** | version, demo frame, smoke **15/15** — see below |
-| **tui-dc** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** |
+| Tool | ubuntu | fedora | omarchy | ubuntu26 |
+|------|--------|--------|---------|----------|
+| **tui-firewall** | version, demo frame, smoke **5/5** | version, demo frame, smoke **14/14** — see below | version, demo frame, smoke **5/5** | — |
+| **tui-systemd** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | — |
+| **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **16/16** | version, demo frame, smoke **17/17** | — |
+| **tui-network** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | — |
+| **tui-secure** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **22/22** | — |
+| **tui-users** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | — |
+| **tui-ssh** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | — |
+| **tui-disk** | version, demo frame, smoke **13/13** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | — |
+| **tui-update** | version, demo frame, smoke **12/12** | version, demo frame, smoke **11/11** | version, demo frame, smoke **13/13** — see below | — |
+| **tui-logs** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | — |
+| **tui-cron** | version, demo frame, smoke **18/18** | version, demo frame, smoke **18/18** | version, demo frame, smoke **19/19** — see below | — |
+| **tui-cert** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | — |
+| **tui-samba** | version, demo frame, smoke **18/18** | version, demo frame, smoke **21/21** — see below | version, demo frame, smoke **18/18** | — |
+| **tui-containers** | version, demo frame, smoke **15/15** | version, demo frame, smoke **13/13** | version, demo frame, smoke **15/15** — see below | — |
+| **tui-dc** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** | — |
+| **tui-tools** | — | — | — | version, demo frame, smoke **21/21** |
 
 The `tui-dc` row is from `2026-09-12` and is the only one of these taken on a guest the lab had already changed on purpose: each of the three was a domain controller by the time the smoke test ran, provisioned minutes earlier through the tool's own wizard by `dc test`. That is deliberate — five of that smoke test's assertions compare the tool's counts against `samba-tool`'s own on a live directory and are skipped on a machine that serves none. The samba version each run exercised was appended to `compat/results.jsonl` in the guest, which is what feeds the tool's compat block: 4.24.6 on Fedora 44, 4.19.5-Ubuntu on Ubuntu 24.04, 4.24.7 on Omarchy Server 4.0.1, all three `pass`.
+
+The `ubuntu26` column is from `2026-09-24`, the day the guest joined, and a dash there means the tool has not been run on it yet, not that it failed. `tui-tools` was the first one run, and on purpose: its dpkg status read had broken on 26.04 before. It passed 21/21 twice, on the clean guest and again after a third-party apt repository and package (Tailscale's) had been added, with its apt 3.2.0 recorded as tested. The backend coverage table below is the first three guests only.
 
 Backend coverage behind those numbers:
 
