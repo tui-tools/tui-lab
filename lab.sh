@@ -2772,11 +2772,12 @@ print(0 if h.get("backend")=="dnsmasq" and h.get("active") and h.get("pools",0)>
 # router test --vpn: item 8, a real WireGuard tunnel the router terminates
 # ---------------------------------------------------------------------------
 # The router and the wan-host bring up a WireGuard tunnel over the WAN segment,
-# exchange a handshake, and pass traffic inside it; then tui-vpn reads the live
-# interface and its peer back. A real encrypted handshake between two machines
+# exchange a handshake, and pass traffic inside it; then tui-wireguard reads the
+# live interface and its peer back. A real encrypted handshake between two machines
 # is not something a rootless demo can do, so this is a lab twin. wireguard-tools
 # is on the base image. Headscale coordination and the OIDC path (item 9) are
-# out of scope here — this proves the WireGuard leg (item 8).
+# out of scope here, and belong to tui-tailscale now: this proves the WireGuard
+# leg (item 8). tui-wireguard was called tui-vpn up to 0.4.x.
 cmd_router_test_vpn() {
   local role
   for role in router lan-client wan-host; do
@@ -2792,13 +2793,13 @@ cmd_router_test_vpn() {
   local ok=""
   { echo "### router terminates a WireGuard tunnel — $(date -Is)"; } >"$rt_log"
 
-  build_tool tui-vpn
-  local vpn_bin="$tool_bin"
-  log "shipping tui-vpn to the router"
-  vm_ssh router "rm -f /tmp/tui-vpn"
-  vm_scp router "$vpn_bin" "/tmp/tui-vpn" >/dev/null
-  vm_ssh router "chmod +x /tmp/tui-vpn"
-  rt_run router "/tmp/tui-vpn --version" >/dev/null
+  build_tool tui-wireguard
+  local wg_bin="$tool_bin"
+  log "shipping tui-wireguard to the router"
+  vm_ssh router "rm -f /tmp/tui-wireguard"
+  vm_scp router "$wg_bin" "/tmp/tui-wireguard" >/dev/null
+  vm_ssh router "chmod +x /tmp/tui-wireguard"
+  rt_run router "/tmp/tui-wireguard --version" >/dev/null
 
   # Keys, generated on each host so no private key ever crosses the wire.
   rt_run router "umask 077; wg genkey | sudo -n tee /etc/wireguard/wg.key >/dev/null; sudo -n sh -c 'wg pubkey < /etc/wireguard/wg.key > /etc/wireguard/wg.pub'" >/dev/null
@@ -2854,10 +2855,10 @@ sudo -n wg-quick up wg0" >/dev/null 2>&1 || true
   ok=1; [[ -n $hs ]] && awk '{ if ($2+0 > 0) found=1 } END { exit found?0:1 }' <<<"$hs" && ok=0
   rt_verdict "the router recorded a handshake with the peer" "$ok"
 
-  # tui-vpn reads the live interface and its peer back.
+  # tui-wireguard reads the live interface and its peer back.
   local check
-  check="$(rt_run router "sudo -n /tmp/tui-vpn --check 2>/dev/null")" || true
-  { echo "--- tui-vpn --check wireguard block ---"; printf '%s\n' "$check" | python3 -c 'import sys,json
+  check="$(rt_run router "sudo -n /tmp/tui-wireguard --check 2>/dev/null")" || true
+  { echo "--- tui-wireguard --check wireguard block ---"; printf '%s\n' "$check" | python3 -c 'import sys,json
 try:
     d=json.load(sys.stdin); print(json.dumps(d.get("wireguard",{}), indent=2)[:900])
 except Exception as e:
@@ -2870,7 +2871,7 @@ except Exception:
 w=d.get("wireguard",{})
 ifaces=[i for i in w.get("interfaces",[]) if i.get("up") and i.get("peerCount",0)>=1]
 print(0 if w.get("available") and ifaces else 1)' 2>/dev/null || echo 1)"
-  rt_verdict "tui-vpn reads the live tunnel: wireguard available, wg0 up with a peer" "$ok"
+  rt_verdict "tui-wireguard reads the live tunnel: wireguard available, wg0 up with a peer" "$ok"
 
   # Tear the tunnel down and remove its keys and config on both hosts.
   rt_run router "sudo -n wg-quick down wg0 >/dev/null 2>&1; sudo -n rm -f /etc/wireguard/wg0.conf /etc/wireguard/wg.key /etc/wireguard/wg.pub" >/dev/null 2>&1 || true
