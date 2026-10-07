@@ -295,24 +295,26 @@ done
 
 | Tool | ubuntu | fedora | omarchy | ubuntu26 |
 |------|--------|--------|---------|----------|
-| **tui-firewall** | version, demo frame, smoke **5/5** | version, demo frame, smoke **14/14** — see below | version, demo frame, smoke **5/5** | — |
-| **tui-systemd** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | version, demo frame, smoke **9/9** | — |
+| **tui-firewall** | version, demo frame, smoke **10/10** | version, demo frame, smoke **21/21** (see below) | version, demo frame, smoke **10/10** | — |
+| **tui-systemd** | version, demo frame, smoke **16/16** | version, demo frame, smoke **16/16** | version, demo frame, smoke **15/16** on 0.2.2, **16/16** with the fix (see below) | — |
 | **tui-snapper** | version, demo frame, smoke **15/15** | version, demo frame, smoke **16/16** | version, demo frame, smoke **17/17** | — |
 | **tui-network** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | version, demo frame, smoke **10/10** | — |
 | **tui-secure** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **22/22** | — |
 | **tui-users** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | version, demo frame, smoke **21/21** | — |
 | **tui-ssh** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | — |
-| **tui-disk** | version, demo frame, smoke **13/13** | version, demo frame, smoke **12/12** | version, demo frame, smoke **12/12** | — |
+| **tui-disk** | version, demo frame, smoke **20/20** on 0.1.4, **21/21** with the fix (see below) | version, demo frame, smoke **19/19**, **22/22** with smartmontools | version, demo frame, smoke **19/19**, **20/20** with the fix | — |
 | **tui-update** | version, demo frame, smoke **12/12** | version, demo frame, smoke **11/11** | version, demo frame, smoke **13/13** — see below | — |
 | **tui-logs** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | version, demo frame, smoke **14/14** | — |
 | **tui-cron** | version, demo frame, smoke **18/18** | version, demo frame, smoke **18/18** | version, demo frame, smoke **19/19** — see below | — |
 | **tui-cert** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | version, demo frame, smoke **22/22** | — |
-| **tui-samba** | version, demo frame, smoke **18/18** | version, demo frame, smoke **21/21** — see below | version, demo frame, smoke **18/18** | — |
+| **tui-samba** | version, demo frame, smoke **18/18** | version, demo frame, smoke **21/21** (see below) | version, demo frame, smoke **18/18** | — |
 | **tui-containers** | version, demo frame, smoke **15/15** | version, demo frame, smoke **13/13** | version, demo frame, smoke **15/15** — see below | — |
 | **tui-dc** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** | version, demo frame, smoke **17/17** | — |
 | **tui-tools** | — | — | — | version, demo frame, smoke **21/21** |
 | **tui-tailscale** | version, demo frame, smoke **14/14** absent, **15/15** installed | version, demo frame, smoke **14/14** absent, **15/15** installed | version, demo frame, smoke **13/13** absent, **15/15** installed | version, demo frame, smoke **14/14** absent, **15/15** installed |
 | **tui-wireguard** | — | version, demo frame, smoke **18/18** | — | version, demo frame, smoke **18/18** |
+
+The `tui-firewall`, `tui-systemd` and `tui-disk` rows are from `2026-10-07`, a run for their stable promotion: the released static binaries (0.6.2, 0.2.2, 0.1.4) on all three guests, one guest up at a time, then the same upgrade on each through its package manager. The previous release of each was installed from its GitHub release package (checksum verified), pkgs.tui.tools was added with its `install.sh`, and `apt-get install --only-upgrade`, `dnf upgrade` and `pacman -Sy` moved all three to the current release from the repository; pacman reported each package validated by its signature. Two smoke tests found something. `tui-systemd` failed one check on `omarchy`: `systemd-analyze verify` also opens the man pages a unit's `Documentation=` names, Omarchy Server ships none, and the drop-in editor read that failure as systemd refusing the file. And `tui-disk` passed on `ubuntu` on nothing: Ubuntu 24.04's kernel refuses `btrfs scrub status` and `btrfs device stats` to an ordinary user, the tool never escalated them, and its error total of zero counted no counters. The "with the fix" counts are from the branches that fix both ([tui-systemd#21](https://github.com/tui-tools/tui-systemd/pull/21), [tui-disk#18](https://github.com/tui-tools/tui-disk/pull/18)), whose smoke tests now assert what was missing. `smartmontools` was installed on `fedora` for one run, the first time the SMART branch of `tui-disk`'s smoke test ran: every virtio disk came back `unknown` with smartctl's reason, as it must.
 
 The `tui-dc` row is from `2026-09-12` and is the only one of these taken on a guest the lab had already changed on purpose: each of the three was a domain controller by the time the smoke test ran, provisioned minutes earlier through the tool's own wizard by `dc test`. That is deliberate — five of that smoke test's assertions compare the tool's counts against `samba-tool`'s own on a live directory and are skipped on a machine that serves none. The samba version each run exercised was appended to `compat/results.jsonl` in the guest, which is what feeds the tool's compat block: 4.24.6 on Fedora 44, 4.19.5-Ubuntu on Ubuntu 24.04, 4.24.7 on Omarchy Server 4.0.1, all three `pass`.
 
